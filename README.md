@@ -57,6 +57,26 @@ MyFitnessPal's login page is **captcha-protected**, so headless password login i
 
 Session cookies expire eventually (~30 days); when tools start failing with auth errors, log into MFP again in that Firefox profile.
 
+### Embedding in a multi-user host
+
+Hosts that serve several MFP accounts from one process can import the tools
+and set the client per call instead of using a cookie source:
+
+```python
+from myfitnesspal_mcp.server import current_mfp_client
+
+token = current_mfp_client.set(client_for_this_user)  # a myfitnesspal.Client
+try:
+    ...  # run the tool
+finally:
+    current_mfp_client.reset(token)
+```
+
+`get_mfp_client()` returns that client when set and falls back to the cookie
+source otherwise. The variable is a `contextvars.ContextVar`, so concurrent
+requests (asyncio tasks or threads started with a copied context) don't see
+each other's client.
+
 ## Environment Variables
 
 | Variable | Default | Description |
