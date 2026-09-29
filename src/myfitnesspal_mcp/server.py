@@ -18,8 +18,10 @@ see cookie_loader.
 import json
 import logging
 import os
+import re
 import sys
 import threading
+import unicodedata
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from enum import Enum
@@ -630,7 +632,11 @@ class AddFoodToDiaryInput(BaseModel):
     )
     meal: str = Field(
         default="Breakfast",
-        description="Meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks')",
+        description=(
+            "Meal name as shown in the account's diary (e.g., 'Breakfast', 'Lunch', "
+            "'Dinner', 'Snacks'); Spanish aliases (Desayuno, Almuerzo/Comida, Cena, "
+            "Merienda) also work. Unknown names are rejected, never defaulted."
+        ),
     )
     date: Optional[str] = Field(
         default=None,
@@ -716,7 +722,10 @@ class UpdateFoodEntryInput(BaseModel):
     )
     meal: Optional[str] = Field(
         default=None,
-        description="New meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks').",
+        description=(
+            "New meal name as shown in the account's diary (e.g., 'Breakfast', 'Dinner'); "
+            "Spanish aliases also work. Unknown names are rejected."
+        ),
     )
     quantity: Optional[float] = Field(
         default=None,
@@ -777,7 +786,7 @@ class SetWaterInput(BaseModel):
 
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
-) -> None:
+) -> Dict[str, Any]:
     """
     Add a food item to the diary for a specific date and meal.
 
@@ -793,6 +802,11 @@ def add_food_to_diary(
     The food's default weight_id (first one MFP exposes for the food) is
     always used. The quantity is in units of that default serving.
 
+    The meal is resolved against the account's own meals (see resolve_meal)
+    before anything is written; unknown names raise ValueError. After the
+    write the diary is read back and the new entry is returned, so callers
+    report the meal MFP actually stored, not the one requested.
+
     Raises RuntimeError if no search result exactly matches the requested
     mfp_id -- we do NOT silently substitute another food, because adding the
     wrong item to a diary is materially worse than failing the call.
@@ -800,22 +814,24 @@ def add_food_to_diary(
     Args:
         client: Authenticated myfitnesspal.Client instance
         mfp_id: MyFitnessPal external food ID (from search results)
-        meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
+        meal: Meal name as configured in the account, or an English/Spanish
+            alias of a default meal (Breakfast/Desayuno, Dinner/Cena, ...)
         target_date: Date to add the food entry
         quantity: Number of default servings (default 1.0)
-    """
-    import re
 
-    meal_map = {"breakfast": "0", "lunch": "1", "dinner": "2",
-                "snacks": "3", "snack": "3"}
-    meal_index = meal_map.get(meal.lower(), "0")
+    Returns:
+        The confirmed diary entry (as in mfp_get_diary), including its
+        ``entry_id`` and the ``meal`` it was stored in.
+    """
     date_str = target_date.strftime("%Y-%m-%d")
 
+    # Step 1: Visit the diary page (Rails session cookies) and resolve the
+    # meal against the account's real meals. Unknown meals fail here, before
+    # anything is written.
+    meal_index, meal_name = resolve_meal(meal, get_account_meals(client, target_date))
+    before_entries = get_diary_entry_snapshots(client, target_date)
+
     try:
-        # Step 1: Visit the diary page so Rails session cookies are present.
-        client._get_document_for_url(
-            f"{client.BASE_URL_SECURE}food/diary"
-        )
 
         # Step 2: Get the add_to_diary page (needed for CSRF + warm form session)
         add_page_url = (
@@ -853,7 +869,7 @@ def add_food_to_diary(
         search_url = f"{client.BASE_URL_SECURE}food/search"
         search_resp = client.session.post(search_url, data={
             "authenticity_token": page_auth,
-            "meal_name": meal,
+            "meal_name": meal_name,
             "search": search_query,
             "date": date_str,
             "page": "1",
@@ -931,11 +947,7 @@ def add_food_to_diary(
         # or 302 to /account/login, or 4xx.
         loc = response.headers.get("Location", "")
         if response.status_code in (302, 303) and "/food/diary" in loc:
-            logger.info(
-                f"Successfully added food {mfp_id} -> original_id={original_id} "
-                f"to {meal} for {target_date}"
-            )
-            return
+            return confirm_added_entry(client, target_date, before_entries, meal_name)
         if response.status_code in (302, 303) and "/account/login" in loc:
             raise RuntimeError(
                 "Add failed: session not authenticated for write. "
@@ -949,6 +961,35 @@ def add_food_to_diary(
         raise
     except Exception as e:
         raise RuntimeError(f"Failed to add food to diary: {e}")
+
+
+def confirm_added_entry(
+    client,
+    target_date: date,
+    before_entries: Dict[str, Dict[str, Any]],
+    meal_name: str,
+) -> Dict[str, Any]:
+    """Read the diary back and return the entry the add just created."""
+    after_entries = get_diary_entry_snapshots(client, target_date)
+    new_entries = [e for entry_id, e in after_entries.items() if entry_id not in before_entries]
+    in_meal = [e for e in new_entries if _fold(e["meal"]) == _fold(meal_name)]
+    if len(in_meal) == 1:
+        # The diary parser lowercases meal names; report the account's own name.
+        in_meal[0]["meal"] = meal_name
+        logger.info(
+            "Added entry %s to %s for %s", in_meal[0]["entry_id"], in_meal[0]["meal"], target_date
+        )
+        return in_meal[0]
+    if new_entries and not in_meal:
+        stored = ", ".join(sorted({e["meal"] for e in new_entries}))
+        raise RuntimeError(
+            f"MyFitnessPal stored the entry in {stored} instead of {meal_name}. "
+            "Move or delete it with mfp_update_food_entry / mfp_delete_food_entry."
+        )
+    raise RuntimeError(
+        f"The add was accepted but the new entry could not be confirmed in {meal_name} "
+        f"on {target_date}; check the diary with mfp_get_diary."
+    )
 
 
 def set_water_intake(client, target_date: date, cups: float) -> None:
@@ -1075,39 +1116,95 @@ def normalize_meal_name(meal: str) -> str:
     return normalized
 
 
-def meal_name_to_id(meal: str) -> str:
-    """Map user-facing meal names to MyFitnessPal's meal IDs."""
-    meal_map = {
-        "breakfast": "0",
-        "lunch": "1",
-        "dinner": "2",
-        "snacks": "3",
-        "snack": "3",
-    }
-    return meal_map.get(normalize_meal_name(meal), "0")
+# Aliases for the four default MFP meals, in English and Spanish, compared
+# after _fold(). They only translate a *requested* name into one of the
+# account's meals: MFP lets each account rename and reorder its meals, so the
+# numeric meal_id always comes from the account (see get_account_meals), never
+# from a fixed 0-3 table.
+MEAL_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "breakfast": ("breakfast", "desayuno"),
+    "lunch": ("lunch", "almuerzo", "comida"),
+    "dinner": ("dinner", "supper", "cena"),
+    "snacks": ("snacks", "snack", "merienda", "tentempie", "aperitivo", "aperitivos"),
+}
+
+_MEAL_LINK = re.compile(r"(?:/diary/add|/quick_add|/add_to_diary)\?(?:[^#]*&)?meal=(\d+)")
 
 
-def meal_id_to_name(meal_id: Optional[Any]) -> Optional[str]:
-    """Map MyFitnessPal meal IDs back to display names."""
-    if meal_id is None:
-        return None
+def _fold(text: str) -> str:
+    """Lowercase, strip accents and collapse whitespace."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    no_accents = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(no_accents.lower().split())
 
-    meal_map = {
-        0: "Breakfast",
-        1: "Lunch",
-        2: "Dinner",
-        3: "Snacks",
-        "0": "Breakfast",
-        "1": "Lunch",
-        "2": "Dinner",
-        "3": "Snacks",
-    }
-    return meal_map.get(meal_id, str(meal_id))
+
+def parse_account_meals(document) -> List[Tuple[str, str]]:
+    """
+    Read the account's meals as (meal_id, name) pairs, in diary order.
+
+    Each meal header row on the diary page is followed by a row whose
+    "Add Food" / "Quick Tools" links carry that meal's real id
+    (``.../diary/add?meal=N``, ``/food/quick_add?meal=N``).
+    """
+    meals: List[Tuple[str, str]] = []
+    for header in document.xpath("//tr[@class='meal_header']"):
+        name = " ".join("".join(header.xpath("./td[1]//text()")).split())
+        meal_id = None
+        row = header
+        while meal_id is None:
+            row = row.getnext()
+            if row is None or row.attrib.get("class") == "meal_header":
+                break
+            for href in row.xpath(".//a/@href"):
+                match = _MEAL_LINK.search(href)
+                if match:
+                    meal_id = match.group(1)
+                    break
+        if name and meal_id is not None:
+            meals.append((meal_id, name))
+    return meals
+
+
+def get_account_meals(client, target_date: Optional[date] = None) -> List[Tuple[str, str]]:
+    """Fetch the diary page and return the account's (meal_id, name) pairs."""
+    meals = parse_account_meals(get_diary_document(client, target_date or date.today()))
+    if not meals:
+        raise RuntimeError("Could not read this account's meals from the diary page")
+    return meals
+
+
+def resolve_meal(meal: str, account_meals: List[Tuple[str, str]]) -> Tuple[str, str]:
+    """
+    Map a requested meal name to one of the account's meals.
+
+    Matches the account's own meal names first (case- and accent-insensitive),
+    then the English/Spanish aliases of the default meals. Anything else --
+    including bare numbers, whose meaning depends on the account -- raises
+    ValueError instead of silently falling back to Breakfast.
+
+    Returns:
+        (meal_id, meal_name) as configured in the account
+    """
+    wanted = _fold(meal or "")
+    if wanted:
+        for meal_id, name in account_meals:
+            if _fold(name) == wanted:
+                return meal_id, name
+        for aliases in MEAL_ALIASES.values():
+            if wanted in aliases:
+                matches = [(i, n) for i, n in account_meals if _fold(n) in aliases]
+                if len(matches) == 1:
+                    return matches[0]
+    valid = ", ".join(name for _, name in account_meals)
+    raise ValueError(
+        f"Unknown meal {meal!r}. This account's meals are: {valid}. "
+        "Spanish names (Desayuno, Almuerzo/Comida, Cena, Merienda) are also accepted."
+    )
 
 
 def get_diary_add_page_url(
     client,
-    meal: str = "Breakfast",
+    meal_id: str = "0",
     target_date: Optional[date] = None,
 ) -> str:
     """
@@ -1123,17 +1220,17 @@ def get_diary_add_page_url(
     target_date = target_date or date.today()
     return parse.urljoin(
         client.BASE_URL_SECURE,
-        f"user/{client.effective_username}/diary/add?meal={meal_name_to_id(meal)}&date={target_date:%Y-%m-%d}",
+        f"user/{client.effective_username}/diary/add?meal={meal_id}&date={target_date:%Y-%m-%d}",
     )
 
 
 def get_diary_add_tab_headers(
     client,
-    meal: str = "Breakfast",
+    meal_id: str = "0",
     target_date: Optional[date] = None,
 ) -> Dict[str, str]:
     """Build the AJAX headers required by the legacy add-page tab endpoints."""
-    add_page_url = get_diary_add_page_url(client, meal=meal, target_date=target_date)
+    add_page_url = get_diary_add_page_url(client, meal_id=meal_id, target_date=target_date)
     document = client._get_document_for_url(add_page_url)
     _, csrf_token = extract_csrf_param_and_token(document)
     return {
@@ -1144,8 +1241,14 @@ def get_diary_add_tab_headers(
     }
 
 
-def normalize_food_collection_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a legacy add-page item into a stable MCP response shape."""
+def normalize_food_collection_item(
+    item: Dict[str, Any], meal_names: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Normalize a legacy add-page item into a stable MCP response shape.
+
+    ``meal_names`` maps the account's meal ids to their names (see
+    get_account_meals); ids missing from it are reported as-is.
+    """
     food = item.get("food", {})
     weight = item.get("weight") or {}
     brand_name = food.get("brand_name")
@@ -1163,7 +1266,7 @@ def normalize_food_collection_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "description": description,
         "brand_name": brand_name,
         "date": item.get("date"),
-        "meal": meal_id_to_name(item.get("meal_id")),
+        "meal": (meal_names or {}).get(str(item.get("meal_id")), item.get("meal_id")),
         "meal_id": item.get("meal_id"),
         "quantity": item.get("quantity"),
         "unit": weight.get("unit"),
@@ -1196,7 +1299,10 @@ def fetch_legacy_food_collection(
     if category not in category_map:
         raise RuntimeError(f"Unsupported legacy food collection '{category}'")
 
-    headers = get_diary_add_tab_headers(client, meal=meal, target_date=target_date)
+    account_meals = get_account_meals(client, target_date)
+    meal_id, _ = resolve_meal(meal, account_meals)
+    meal_names = dict(account_meals)
+    headers = get_diary_add_tab_headers(client, meal_id=meal_id, target_date=target_date)
     endpoint = parse.urljoin(client.BASE_URL_SECURE, f"food/load_{category_map[category]}")
 
     items: List[Dict[str, Any]] = []
@@ -1205,7 +1311,7 @@ def fetch_legacy_food_collection(
     while len(items) < limit:
         response = client.session.post(
             endpoint,
-            data={"meal": meal_name_to_id(meal), "base_index": base_index, "page": page},
+            data={"meal": meal_id, "base_index": base_index, "page": page},
             headers=headers,
         )
         response.raise_for_status()
@@ -1214,7 +1320,7 @@ def fetch_legacy_food_collection(
         if not batch:
             break
 
-        items.extend(normalize_food_collection_item(item) for item in batch)
+        items.extend(normalize_food_collection_item(item, meal_names) for item in batch)
         base_index += len(batch)
         page += 1
 
@@ -1367,6 +1473,10 @@ def update_food_entry(
     """Update an existing diary entry and return the confirmed resulting entry."""
     from urllib import parse
 
+    meal_id = meal_name = None
+    if meal:
+        meal_id, meal_name = resolve_meal(meal, get_account_meals(client, target_date))
+
     before_entries = get_diary_entry_snapshots(client, target_date)
     original_entry = before_entries.get(entry_id)
     if not original_entry:
@@ -1384,7 +1494,7 @@ def update_food_entry(
         "food_entry[date]": target_date.strftime("%Y-%m-%d"),
         "food_entry[quantity]": str(quantity if quantity is not None else val(".//input[@name='food_entry[quantity]']/@value")),
         "food_entry[weight_id]": resolve_weight_id(form, weight_id=weight_id, unit=unit),
-        "food_entry[meal_id]": meal_name_to_id(meal) if meal else val(".//select[@name='food_entry[meal_id]']/option[@selected='selected']/@value"),
+        "food_entry[meal_id]": meal_id if meal_id is not None else val(".//select[@name='food_entry[meal_id]']/option[@selected='selected']/@value"),
     }
 
     action = parse.urljoin(client.BASE_URL_SECURE, form.attrib["action"])
@@ -1401,9 +1511,17 @@ def update_food_entry(
     after_entries = get_diary_entry_snapshots(client, target_date)
     current_entry = after_entries.get(entry_id)
     if current_entry is None:
-        current_entry = find_replacement_entry(before_entries, after_entries, original_entry, meal)
+        current_entry = find_replacement_entry(before_entries, after_entries, original_entry, meal_name)
     if current_entry is None:
         raise RuntimeError(f"Updated entry {entry_id} could not be confirmed on {target_date}")
+    if meal_name:
+        if _fold(current_entry["meal"]) != _fold(meal_name):
+            raise RuntimeError(
+                f"Entry {current_entry['entry_id']} ended up in {current_entry['meal']}, "
+                f"not in the requested {meal_name}"
+            )
+        # The diary parser lowercases meal names; report the account's own name.
+        current_entry["meal"] = meal_name
 
     logger.info(
         "Successfully updated food entry %s for %s (current entry id: %s)",
@@ -2105,7 +2223,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
     Args:
         params: AddFoodToDiaryInput containing:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
-            - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
+            - meal (str): Meal name as shown in the account's diary, or an English/Spanish
+              alias of a default meal (default: 'Breakfast'). Unknown names are an error.
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
             - quantity (float): Number of default servings for this food (default: 1.0)
 
@@ -2116,19 +2235,14 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
 
-        # Normalize meal name (capitalize first letter)
-        meal = params.meal.strip().capitalize()
-        if meal.lower() == "snack":
-            meal = "Snacks"
-
-        # Add food to diary
-        add_food_to_diary(
+        entry = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
-            meal=meal,
+            meal=params.meal,
             target_date=target_date,
             quantity=params.quantity,
         )
+        meal = entry["meal"]
 
         # Get food details for confirmation
         try:
@@ -2143,6 +2257,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
                 "message": f"Successfully added {food_name} to {meal}",
                 "date": str(target_date),
                 "meal": meal,
+                "confirmed_meal": meal,
+                "entry_id": entry.get("entry_id"),
                 "food_id": params.mfp_id,
                 "food_name": food_name,
                 "quantity": params.quantity,
