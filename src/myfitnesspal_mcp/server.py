@@ -21,6 +21,7 @@ import os
 import sys
 import threading
 from collections import OrderedDict
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from enum import Enum
 from http.cookiejar import CookieJar
@@ -197,6 +198,12 @@ _client_lock = threading.Lock()
 _cached_client: Any = None
 _cached_jar: Optional[CookieJar] = None
 
+# Per-request client override for hosts that serve several MFP accounts from
+# one process (e.g. a multi-user gateway that imports these tools). The host
+# sets it around each tool call; when unset, get_mfp_client() falls back to
+# the single-account cookie source as before.
+current_mfp_client: ContextVar[Any] = ContextVar("current_mfp_client", default=None)
+
 
 def create_mfp_client(cookiejar: Optional[CookieJar] = None):
     """
@@ -234,8 +241,9 @@ def get_mfp_client():
     """
     Get an authenticated MyFitnessPal client.
 
-    Session cookies are loaded via cookie_loader (Firefox profile mount or
-    JSON cookies file). The client is cached and only rebuilt when the
+    If a host has set ``current_mfp_client`` for the current context, that
+    client is returned as-is. Otherwise session cookies are loaded via
+    cookie_loader (Firefox profile mount or JSON cookies file). The client is cached and only rebuilt when the
     underlying cookie source changes (cookie_loader returns the same jar
     object while the source file is unchanged).
 
@@ -246,6 +254,10 @@ def get_mfp_client():
         RuntimeError: If no cookie source is configured or readable
     """
     global _cached_client, _cached_jar
+
+    override = current_mfp_client.get()
+    if override is not None:
+        return override
 
     jar = cookie_loader.get_cookiejar()
     with _client_lock:
