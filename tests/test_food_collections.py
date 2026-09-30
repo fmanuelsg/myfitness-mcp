@@ -2,7 +2,13 @@
 
 from datetime import date
 
-from myfitnesspal_mcp.server import fetch_frequent_foods, fetch_my_foods
+import pytest
+
+from myfitnesspal_mcp.server import (
+    delete_custom_food,
+    fetch_frequent_foods,
+    fetch_my_foods,
+)
 
 
 class FakeResponse:
@@ -78,3 +84,63 @@ def test_my_foods():
         "food_id": "125094978231525",
         "food_version": "125094978231525",
     }]
+
+
+def test_my_foods_search_is_sent_to_mfp():
+    client = FakeClient([])
+    fetch_my_foods(client, limit=10, search="naranja")
+    assert client.session.calls == [("users/foods/mine", {"search": "naranja"})]
+
+
+class DeleteSession:
+    """users/foods/mine lists ``foods``; DELETE removes one unless ``stuck``."""
+
+    def __init__(self, foods, stuck=False, delete_status=204):
+        self.foods, self.stuck, self.delete_status = foods, stuck, delete_status
+        self.deleted = []
+
+    def get(self, url, params=None, headers=None):
+        if url.endswith("api/auth/csrf"):
+            return FakeResponse({"csrfToken": "tok"})
+        return FakeResponse(list(self.foods))
+
+    def delete(self, url, headers=None):
+        food_id = url.rsplit("/", 1)[1]
+        self.deleted.append((food_id, headers["x-csrf-token"]))
+        if not self.stuck:
+            self.foods = [f for f in self.foods if f["id"] != food_id]
+        response = FakeResponse(None)
+        response.status_code = self.delete_status
+        return response
+
+
+OWN = [{"id": "93759010029157", "description": "Tortilla", "brand_name": "Casero"}]
+
+
+def delete_client(**kwargs):
+    client = FakeClient([])
+    client.session = DeleteSession(OWN, **kwargs)
+    return client
+
+
+def test_delete_own_food():
+    client = delete_client()
+    assert delete_custom_food(client, "93759010029157") == {
+        "food_id": "93759010029157", "name": "Casero - Tortilla", "deleted": True,
+    }
+    assert client.session.deleted == [("93759010029157", "tok")]
+
+
+def test_delete_refuses_foods_the_account_did_not_create():
+    # e.g. an mfp_id from mfp_search_food: nothing is sent to MFP.
+    client = delete_client()
+    with pytest.raises(RuntimeError, match="not one of the foods"):
+        delete_custom_food(client, "164248067900917")
+    assert client.session.deleted == []
+
+
+def test_delete_reports_http_errors_and_unapplied_deletes():
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        delete_custom_food(delete_client(stuck=True, delete_status=403), "93759010029157")
+    with pytest.raises(RuntimeError, match="still listed"):
+        delete_custom_food(delete_client(stuck=True), "93759010029157")

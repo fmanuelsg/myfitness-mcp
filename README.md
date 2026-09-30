@@ -23,13 +23,16 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_set_water` | Write | Log water intake for a date |
 | `mfp_add_food_to_diary` | Write | Add a food entry to a meal |
 | `mfp_create_food` | Write | Create a new custom food in the MyFitnessPal database |
+| `mfp_delete_custom_food` | Write | Delete one of the account's own foods (irreversible) |
 | `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
 | `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
 
 ### Food collections (recent / frequent / my foods)
 
-`mfp_get_recent_foods`, `mfp_get_frequent_foods`, and `mfp_get_my_foods` each take an optional `limit` (recent/frequent default 10, my-foods default 100, max 100) and `response_format` (`markdown` or `json`). They intentionally use the **legacy add-to-diary AJAX endpoints** (`/food/load_recent`, `/food/load_most_used`, `/food/load_my_foods`) rather than the newer `/food/mine`, `/meal/mine`, or `/food/new` pages, which can redirect to `/account/logout` even when diary reads and API-token fetches still work.
+`mfp_get_recent_foods`, `mfp_get_frequent_foods`, and `mfp_get_my_foods` each take an optional `limit` (recent/frequent default 10, my-foods default 100, max 100) and `response_format` (`markdown` or `json`); `mfp_get_my_foods` also takes `search`. Frequent foods come from the web's `/api/services/top_foods` (last 90 days) and my foods from `/api/services/users/foods/mine`; recent foods still use the legacy `/food/load_recent` AJAX endpoint, which can take ~45 s.
+
+`mfp_delete_custom_food` deletes one of the account's own foods by the `food_id` that `mfp_get_my_foods` returns (`DELETE /api/services/foods/{id}`, ported from AdamWalt/myfitnesspal-mcp-python). Other ids are refused before anything is sent. Diary entries already logged with the food keep their name and nutrition.
 
 ### Editing diary entries
 
