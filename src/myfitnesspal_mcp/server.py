@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import threading
+import time
 import unicodedata
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -558,7 +559,7 @@ class SetMeasurementInput(BaseModel):
     )
     value: float = Field(
         ...,
-        description="Measurement value (e.g., 185.5 for weight in lbs)",
+        description="Measurement value; weight in the account's unit (kg or lb)",
         gt=0,
     )
 
@@ -890,25 +891,62 @@ def format_food_details(food: Dict[str, Any], mfp_id: str) -> Dict[str, Any]:
     }
 
 
+WEIGHT_TYPE = "Weight"
+
+
+def _measurement_key(name: str) -> str:
+    """'Body Fat', 'body fat %' and 'Body Fat %' all name the same type."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def get_measurement_types(client) -> List[str]:
+    """Weight plus the account's own types, from the route the web client uses."""
+    response = client.session.get(
+        f"{client.BASE_URL_SECURE}api/user-measurements/measurements/types",
+        headers={"accept": "application/json"},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch measurement types: HTTP {response.status_code}")
+    return [WEIGHT_TYPE] + [item["description"] for item in response.json()]
+
+
+def resolve_measurement_type(client, measurement: str) -> str:
+    """The account's exact name for ``measurement``; ValueError listing the valid ones if none."""
+    key = _measurement_key(measurement)
+    if key == _measurement_key(WEIGHT_TYPE):
+        return WEIGHT_TYPE
+    types = get_measurement_types(client)
+    for name in types:
+        if _measurement_key(name) == key:
+            return name
+    raise ValueError(f"Unknown measurement '{measurement}'. This account tracks: {', '.join(types)}")
+
+
 def get_measurements_v2(client, measurement: str, start: date, end: date) -> Dict[date, float]:
     """
     Measurements of one type between two dates (inclusive), from GET v2/measurements.
 
     python-myfitnesspal's get_measurements() reads a "dehydratedState" blob that
     MFP no longer serves to every session (KeyError on some, fine on others).
-    The v2 endpoint ignores its type/date filters and returns everything newest
-    first, 500 per page, paged with ``offset``: filter here and stop paging once
+    The v2 endpoint filters with ``types``/``from``/``to`` (without ``types`` it
+    returns only Weight), newest first, 500 per page, paged with ``offset``.
+    Filter again here in case the server ignores a filter, and stop paging once
     past ``start``. If a date has several entries, the newest one wins.
 
-    Ported from AdamWalt/myfitnesspal-mcp-python#21, plus paging.
+    ``measurement`` is the account's exact type name (resolve_measurement_type).
+
+    Ported from AdamWalt/myfitnesspal-mcp-python#21, plus paging and filters.
     """
-    wanted = measurement.strip().lower()
+    wanted = _measurement_key(measurement)
     found: Dict[date, float] = {}
     offset = 0
     while True:
+        query = {"types": measurement, "from": start.isoformat(), "to": end.isoformat()}
+        if offset:
+            query["offset"] = offset
         response = client.session.get(
             f"{client.BASE_API_URL}v2/measurements",
-            params={"offset": offset} if offset else None,
+            params=query,
             headers=mfp_api_headers(client),
         )
         if response.status_code != 200:
@@ -917,11 +955,82 @@ def get_measurements_v2(client, measurement: str, start: date, end: date) -> Dic
         items = payload.get("items") or []
         for item in items:
             day = parse_date(item["date"])
-            if (item.get("type") or "").strip().lower() == wanted and start <= day <= end:
+            if _measurement_key(item.get("type") or "") == wanted and start <= day <= end:
                 found.setdefault(day, float(item["value"]))
         if not items or not payload.get("has_more") or parse_date(items[-1]["date"]) < start:
             return found
         offset += len(items)
+
+
+def get_measurement_entries(client, measurement: str, day: date) -> List[Dict[str, Any]]:
+    """Raw entries (id, type, value, unit, date) of one type on one day, newest first."""
+    response = client.session.get(
+        f"{client.BASE_API_URL}v2/measurements",
+        params={"types": measurement, "from": day.isoformat(), "to": day.isoformat()},
+        headers=mfp_api_headers(client),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch measurements: HTTP {response.status_code}")
+    return [
+        item
+        for item in response.json().get("items") or []
+        if _measurement_key(item.get("type") or "") == _measurement_key(measurement)
+        and item.get("date") == day.isoformat()
+    ]
+
+
+def account_weight_unit(client) -> str:
+    """'kilograms' or 'pounds', as the account shows weight (stones are entered as pounds)."""
+    prefs = (getattr(client, "user_metadata", None) or {}).get("unit_preferences") or {}
+    return "kilograms" if prefs.get("weight") == "kilograms" else "pounds"
+
+
+def set_measurement_v2(client, measurement: str, value: float, day: date) -> Dict[str, Any]:
+    """
+    Write one measurement the way the web client does and return the stored entry.
+
+    python-myfitnesspal's set_measurements() posts a /measurements/new form that
+    the measurements page no longer contains ("list index out of range").
+    Weight goes through the incubator upsert (in the account's unit; it replaces
+    that day's weight); other types through PUT /api/user-measurements/measurements.
+    ``measurement`` is the account's exact type name (resolve_measurement_type).
+    """
+    api = f"{client.BASE_URL_SECURE}api/"
+    headers = {"accept": "application/json"}
+    if measurement == WEIGHT_TYPE:
+        response = client.session.put(
+            f"{api}services/incubator/measurements/upsert",
+            json={
+                "item": {
+                    "entry_date": day.isoformat(),
+                    "unit": account_weight_unit(client),
+                    "value": value,
+                    "type": "weight",
+                }
+            },
+            headers=headers,
+        )
+    else:
+        response = client.session.put(
+            f"{api}user-measurements/measurements",
+            json={"items": [{"type": measurement, "value": value, "date": day.isoformat()}]},
+            headers=headers,
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not save {measurement}: HTTP {response.status_code}")
+
+    # The read right after a write has returned a one-off HTTP 400 (2026-09-30).
+    for attempt in range(2):
+        try:
+            entries = get_measurement_entries(client, measurement, day)
+            break
+        except RuntimeError as e:
+            if attempt:
+                raise RuntimeError(f"{measurement} was saved, but reading it back failed: {e}") from e
+            time.sleep(1)
+    if not entries:
+        raise RuntimeError(f"MyFitnessPal accepted {measurement} but it is not in the account")
+    return entries[0]
 
 
 def add_food_to_diary(
@@ -2029,11 +2138,10 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = get_measurements_v2(client, params.measurement, start, end)
-        data = measurements_payload(measurements, params.measurement, start, end)
-        return format_response(
-            data, params.response_format, f"{params.measurement} History"
-        )
+        measurement = resolve_measurement_type(client, params.measurement)
+        measurements = get_measurements_v2(client, measurement, start, end)
+        data = measurements_payload(measurements, measurement, start, end)
+        return format_response(data, params.response_format, f"{measurement} History")
 
     except Exception as e:
         return f"Error getting measurements: {str(e)}"
@@ -2054,26 +2162,30 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
     Log a new body measurement (weight, body fat, etc.) for today.
 
     Records the measurement value in MyFitnessPal for tracking progress.
+    A new weight replaces today's weight.
 
     Args:
         params: SetMeasurementInput containing:
             - measurement (str): Type of measurement (default 'Weight')
-            - value (float): Measurement value (e.g., 185.5)
+            - value (float): Measurement value (weight in the account's unit)
 
     Returns:
-        str: Confirmation message with the logged value
+        str: The measurement as stored by MyFitnessPal (value, unit, date)
     """
     try:
         client = get_mfp_client()
-        client.set_measurements(params.measurement, params.value)
+        measurement = resolve_measurement_type(client, params.measurement)
+        stored = set_measurement_v2(client, measurement, params.value, date.today())
 
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully logged {params.measurement}: {params.value}",
-                "measurement": params.measurement,
-                "value": params.value,
-                "date": str(date.today()),
+                "message": f"Successfully logged {measurement}: {stored.get('value')}",
+                "measurement": measurement,
+                "value": stored.get("value"),
+                "unit": stored.get("unit"),
+                "date": stored.get("date"),
+                "id": stored.get("id"),
             },
             indent=2,
         )
