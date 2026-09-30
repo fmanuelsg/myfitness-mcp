@@ -1117,6 +1117,41 @@ def set_goals_v2(client, day: date, **asked: Optional[float]) -> Dict[str, float
     return goals_from_item(_nutrient_goals_item(client, day))
 
 
+def get_report_values(
+    client, report_name: str, start: date, end: date, today: Optional[date] = None
+) -> "OrderedDict[date, float]":
+    """
+    Daily values of a nutrition report between two dates (inclusive), oldest first.
+
+    The endpoint returns the last N days up to today, each with its date ("9/23").
+    python-myfitnesspal asked for one day less than needed, so the first day
+    of the range was missing, and dated values by position. Ask for a spare
+    day (the server's today may differ from MFP's) and use MFP's dates. Ranges
+    starting more than ~100 days back fail on MFP's side (HTTP 500).
+    """
+    today = today or date.today()
+    days = max((today - start).days, 0) + 2
+    response = client.session.get(
+        f"{client.BASE_URL_SECURE}api/services/reports/results/nutrition/{report_name}/{days}.json",
+        headers={"accept": "application/json"},
+    )
+    results = (response.json().get("outcome") or {}).get("results") if response.status_code == 200 else None
+    if not results:
+        raise RuntimeError(
+            f"MyFitnessPal returned no '{report_name}' report for the last {days} days "
+            f"(HTTP {response.status_code}); reports only reach about 100 days back"
+        )
+    report: "OrderedDict[date, float]" = OrderedDict()
+    for entry in results:
+        month, day_of_month = (int(x) for x in entry["date"].split("/"))
+        day = date(today.year, month, day_of_month)
+        if day > today + timedelta(days=1):  # December values seen in January
+            day = day.replace(year=today.year - 1)
+        if start <= day <= end:
+            report[day] = entry["total"]
+    return report
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
 ) -> Dict[str, Any]:
@@ -2979,12 +3014,7 @@ async def mfp_get_report(params: GetReportInput) -> str:
         else:
             start = end - timedelta(days=7)
 
-        report = client.get_report(
-            report_name=params.report_name,
-            report_category="Nutrition",
-            lower_bound=start,
-            upper_bound=end,
-        )
+        report = get_report_values(client, params.report_name, start, end)
 
         data = {
             "report_name": params.report_name,
