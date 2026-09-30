@@ -363,6 +363,37 @@ def ordered_dict_to_dict(od: OrderedDict) -> Dict[str, Any]:
     return {str(k): v for k, v in od.items()}
 
 
+def measurements_payload(
+    measurements: Dict[date, float], measurement: str, start: date, end: date
+) -> Dict[str, Any]:
+    """
+    mfp_get_measurements output, oldest first.
+
+    python-myfitnesspal returns measurements newest first; the summary takes
+    earliest/latest from the ends, so without sorting it came out reversed
+    (and ``change`` had the wrong sign).
+    """
+    ordered = OrderedDict(sorted(measurements.items()))
+    data: Dict[str, Any] = {
+        "measurement_type": measurement,
+        "start_date": str(start),
+        "end_date": str(end),
+        "count": len(ordered),
+        "values": ordered_dict_to_dict(ordered),
+    }
+    if ordered:
+        values = list(ordered.values())
+        data["summary"] = {
+            "latest": values[-1],
+            "earliest": values[0],
+            "change": round(values[-1] - values[0], 2),
+            "min": min(values),
+            "max": max(values),
+            "average": round(sum(values) / len(values), 2),
+        }
+    return data
+
+
 class ResponseFormat(str, Enum):
     """Output format for tool responses."""
 
@@ -1945,27 +1976,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
             start = end - timedelta(days=30)
 
         measurements = client.get_measurements(params.measurement, start, end)
-
-        data = {
-            "measurement_type": params.measurement,
-            "start_date": str(start),
-            "end_date": str(end),
-            "count": len(measurements),
-            "values": ordered_dict_to_dict(measurements),
-        }
-
-        # Calculate summary stats if we have data
-        if measurements:
-            values = list(measurements.values())
-            data["summary"] = {
-                "latest": values[-1] if values else None,
-                "earliest": values[0] if values else None,
-                "change": round(values[-1] - values[0], 2) if len(values) >= 2 else 0,
-                "min": min(values),
-                "max": max(values),
-                "average": round(sum(values) / len(values), 2),
-            }
-
+        data = measurements_payload(measurements, params.measurement, start, end)
         return format_response(
             data, params.response_format, f"{params.measurement} History"
         )
