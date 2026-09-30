@@ -523,6 +523,28 @@ class GetFoodCollectionInput(BaseModel):
     )
 
 
+class GetMyFoodsInput(GetFoodCollectionInput):
+    """Input model for listing the foods the account created."""
+
+    search: Optional[str] = Field(
+        default=None,
+        description="Only foods whose name contains this text (case-insensitive).",
+        min_length=1,
+    )
+
+
+class DeleteCustomFoodInput(BaseModel):
+    """Input model for deleting a food the account created."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    food_id: str = Field(
+        ...,
+        description="food_id of one of the account's own foods, from mfp_get_my_foods.",
+        pattern=r"^\d+$",
+    )
+
+
 class GetMeasurementsInput(BaseModel):
     """Input model for getting measurements."""
 
@@ -1778,21 +1800,27 @@ def fetch_frequent_foods(
     ]
 
 
-def fetch_my_foods(client, limit: int) -> List[Dict[str, Any]]:
+def _my_foods(client, search: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Raw foods the account created, newest first; ``search`` filters by name on MFP's side."""
+    response = client.session.get(
+        f"{client.BASE_URL_SECURE}api/services/users/foods/mine",
+        params={"search": search} if search else None,
+        headers={"accept": "application/json"},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch my foods: HTTP {response.status_code}")
+    return response.json() or []
+
+
+def fetch_my_foods(client, limit: int, search: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Foods the account created, from the web's /api/services/users/foods/mine route.
 
     Same foods as the legacy ``load_my_foods`` endpoint (checked 2026-09-30),
     in 0.3 s instead of ~45 s.
     """
-    response = client.session.get(
-        f"{client.BASE_URL_SECURE}api/services/users/foods/mine",
-        headers={"accept": "application/json"},
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"Could not fetch my foods: HTTP {response.status_code}")
     items = []
-    for food in response.json()[:limit]:
+    for food in _my_foods(client, search)[:limit]:
         serving = (food.get("serving_sizes") or [{}])[0]
         energy = (food.get("nutritional_contents") or {}).get("energy") or {}
         items.append(
@@ -1808,6 +1836,40 @@ def fetch_my_foods(client, limit: int) -> List[Dict[str, Any]]:
             }
         )
     return items
+
+
+def delete_custom_food(client, food_id: str) -> Dict[str, Any]:
+    """
+    Delete a food the account created: DELETE /api/services/foods/{id}, as the
+    web does, with the CSRF token of /api/auth/csrf.
+
+    Ported from AdamWalt/myfitnesspal-mcp-python (custom foods). Unlike there,
+    the id must be one of the account's own foods (mfp_get_my_foods), so a
+    search result's id or a public food gets a clear error instead of an HTTP
+    one. Past diary entries of the food keep their name and nutrition (checked
+    2026-09-30, diary page and v2/diary).
+    """
+    food = next((f for f in _my_foods(client) if str(f.get("id")) == food_id), None)
+    if food is None:
+        raise RuntimeError(
+            f"Food {food_id} is not one of the foods this account created. "
+            "mfp_get_my_foods lists them with their food_id; other foods cannot be deleted."
+        )
+    web = client.BASE_URL_SECURE
+    csrf = client.session.get(f"{web}api/auth/csrf", headers={"accept": "application/json"})
+    token = csrf.json().get("csrfToken") if csrf.status_code == 200 else None
+    if not token:
+        raise RuntimeError(f"Could not get a CSRF token to delete the food: HTTP {csrf.status_code}")
+    response = client.session.delete(
+        f"{web}api/services/foods/{food_id}",
+        headers={"accept": "application/json", "x-csrf-token": token},
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"MyFitnessPal did not delete food {food_id}: HTTP {response.status_code}")
+    if any(str(f.get("id")) == food_id for f in _my_foods(client)):
+        raise RuntimeError(f"MyFitnessPal accepted the delete but food {food_id} is still listed")
+    logger.info("Deleted custom food %s", food_id)
+    return {"food_id": food_id, "name": _food_name(food), "deleted": True}
 
 
 def extract_diary_entry_ids(client, target_date: date) -> Dict[str, List[Optional[str]]]:
@@ -2410,13 +2472,17 @@ async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
         "openWorldHint": True,
     },
 )
-async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
+async def mfp_get_my_foods(params: GetMyFoodsInput) -> str:
     """
-    Get foods created by the authenticated user.
+    Get foods created by the authenticated user, newest first.
+
+    Their food_id works as mfp_id in mfp_add_food_to_diary and is what
+    mfp_delete_custom_food takes.
 
     Args:
-        params: GetFoodCollectionInput containing:
+        params: GetMyFoodsInput containing:
             - limit (int, optional): Max results (default 100, max 100)
+            - search (str, optional): Only foods whose name contains this text
             - response_format (str): 'markdown' or 'json'
 
     Returns:
@@ -2425,10 +2491,11 @@ async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
     try:
         client = get_mfp_client()
         limit = params.limit or 100
-        items = fetch_my_foods(client, limit)
+        items = fetch_my_foods(client, limit, search=params.search)
         data = {
             "count": len(items),
             "limit": limit,
+            "search": params.search,
             "items": items,
         }
         return format_response(data, params.response_format, "My Foods")
@@ -3037,6 +3104,40 @@ async def mfp_create_food(params: CreateFoodInput) -> str:
 
     except Exception as e:
         return f"Error creating custom food: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_custom_food",
+    annotations={
+        "title": "Delete Custom Food",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
+    """
+    Permanently delete one of the foods the user created (from mfp_get_my_foods).
+
+    Irreversible: MyFitnessPal has no undo, and recreating the food gives it a
+    new id. Confirm with the user which food to delete before calling. Diary
+    entries already logged with the food keep their name and nutrition; the
+    food just can no longer be found or logged. Only the account's own foods
+    can be deleted; other ids are an error.
+
+    Args:
+        params: DeleteCustomFoodInput containing:
+            - food_id (str): food_id from mfp_get_my_foods
+
+    Returns:
+        str: JSON with the deleted food's id and name
+    """
+    try:
+        client = get_mfp_client()
+        return json.dumps({"success": True, **delete_custom_food(client, params.food_id)}, indent=2)
+    except Exception as e:
+        return f"Error deleting custom food: {str(e)}"
 
 
 @mcp.tool(
