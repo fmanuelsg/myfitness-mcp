@@ -890,25 +890,62 @@ def format_food_details(food: Dict[str, Any], mfp_id: str) -> Dict[str, Any]:
     }
 
 
+WEIGHT_TYPE = "Weight"
+
+
+def _measurement_key(name: str) -> str:
+    """'Body Fat', 'body fat %' and 'Body Fat %' all name the same type."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def get_measurement_types(client) -> List[str]:
+    """Weight plus the account's own types, from the route the web client uses."""
+    response = client.session.get(
+        f"{client.BASE_URL_SECURE}api/user-measurements/measurements/types",
+        headers={"accept": "application/json"},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch measurement types: HTTP {response.status_code}")
+    return [WEIGHT_TYPE] + [item["description"] for item in response.json()]
+
+
+def resolve_measurement_type(client, measurement: str) -> str:
+    """The account's exact name for ``measurement``; ValueError listing the valid ones if none."""
+    key = _measurement_key(measurement)
+    if key == _measurement_key(WEIGHT_TYPE):
+        return WEIGHT_TYPE
+    types = get_measurement_types(client)
+    for name in types:
+        if _measurement_key(name) == key:
+            return name
+    raise ValueError(f"Unknown measurement '{measurement}'. This account tracks: {', '.join(types)}")
+
+
 def get_measurements_v2(client, measurement: str, start: date, end: date) -> Dict[date, float]:
     """
     Measurements of one type between two dates (inclusive), from GET v2/measurements.
 
     python-myfitnesspal's get_measurements() reads a "dehydratedState" blob that
     MFP no longer serves to every session (KeyError on some, fine on others).
-    The v2 endpoint ignores its type/date filters and returns everything newest
-    first, 500 per page, paged with ``offset``: filter here and stop paging once
+    The v2 endpoint filters with ``types``/``from``/``to`` (without ``types`` it
+    returns only Weight), newest first, 500 per page, paged with ``offset``.
+    Filter again here in case the server ignores a filter, and stop paging once
     past ``start``. If a date has several entries, the newest one wins.
 
-    Ported from AdamWalt/myfitnesspal-mcp-python#21, plus paging.
+    ``measurement`` is the account's exact type name (resolve_measurement_type).
+
+    Ported from AdamWalt/myfitnesspal-mcp-python#21, plus paging and filters.
     """
-    wanted = measurement.strip().lower()
+    wanted = _measurement_key(measurement)
     found: Dict[date, float] = {}
     offset = 0
     while True:
+        query = {"types": measurement, "from": start.isoformat(), "to": end.isoformat()}
+        if offset:
+            query["offset"] = offset
         response = client.session.get(
             f"{client.BASE_API_URL}v2/measurements",
-            params={"offset": offset} if offset else None,
+            params=query,
             headers=mfp_api_headers(client),
         )
         if response.status_code != 200:
@@ -917,7 +954,7 @@ def get_measurements_v2(client, measurement: str, start: date, end: date) -> Dic
         items = payload.get("items") or []
         for item in items:
             day = parse_date(item["date"])
-            if (item.get("type") or "").strip().lower() == wanted and start <= day <= end:
+            if _measurement_key(item.get("type") or "") == wanted and start <= day <= end:
                 found.setdefault(day, float(item["value"]))
         if not items or not payload.get("has_more") or parse_date(items[-1]["date"]) < start:
             return found
@@ -2029,11 +2066,10 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = get_measurements_v2(client, params.measurement, start, end)
-        data = measurements_payload(measurements, params.measurement, start, end)
-        return format_response(
-            data, params.response_format, f"{params.measurement} History"
-        )
+        measurement = resolve_measurement_type(client, params.measurement)
+        measurements = get_measurements_v2(client, measurement, start, end)
+        data = measurements_payload(measurements, measurement, start, end)
+        return format_response(data, params.response_format, f"{measurement} History")
 
     except Exception as e:
         return f"Error getting measurements: {str(e)}"

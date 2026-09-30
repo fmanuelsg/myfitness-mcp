@@ -3,7 +3,13 @@
 from collections import OrderedDict
 from datetime import date
 
-from myfitnesspal_mcp.server import get_measurements_v2, measurements_payload
+import pytest
+
+from myfitnesspal_mcp.server import (
+    get_measurements_v2,
+    measurements_payload,
+    resolve_measurement_type,
+)
 
 
 def test_newest_first_input_gives_chronological_summary():
@@ -35,21 +41,36 @@ class FakeResponse:
 
 
 class PagedSession:
-    """v2/measurements as seen live: newest first, fixed page size, paged by offset,
-    type/date filters ignored."""
+    """v2/measurements as seen live (2026-09-30): only Weight unless ``types`` is
+    given, filtered by ``from``/``to``, newest first, fixed page size, paged by offset.
+    Also serves the web's measurement-types route."""
 
-    def __init__(self, items, page_size=2):
-        self.items, self.page_size, self.offsets = items, page_size, []
+    def __init__(self, items, page_size=2, types=("Neck", "Waist", "Body Fat %")):
+        self.items, self.page_size, self.types = items, page_size, types
+        self.offsets, self.queries, self.type_requests = [], [], 0
 
     def get(self, url, params=None, headers=None):
-        offset = (params or {}).get("offset", 0)
+        if url.endswith("/measurements/types"):
+            self.type_requests += 1
+            return FakeResponse([{"id": i, "description": d} for i, d in enumerate(self.types)])
+        params = params or {}
+        self.queries.append(params)
+        offset = params.get("offset", 0)
         self.offsets.append(offset)
-        page = self.items[offset : offset + self.page_size]
-        return FakeResponse({"items": page, "has_more": offset + len(page) < len(self.items)})
+        wanted = params.get("types", "Weight")
+        items = [
+            i
+            for i in self.items
+            if i["type"] == wanted
+            and params.get("from", "0000") <= i["date"] <= params.get("to", "9999")
+        ]
+        page = items[offset : offset + self.page_size]
+        return FakeResponse({"items": page, "has_more": offset + len(page) < len(items)})
 
 
 class FakeClient:
     BASE_API_URL = "https://api.myfitnesspal.com/"
+    BASE_URL_SECURE = "https://www.myfitnesspal.com/"
     access_token = "tok"
     user_id = 42
 
@@ -59,7 +80,7 @@ class FakeClient:
 
 ITEMS = [
     {"type": "Weight", "date": "2026-09-28", "value": 73.4},
-    {"type": "Body Fat", "date": "2026-09-27", "value": 18.0},
+    {"type": "Body Fat %", "date": "2026-09-27", "value": 18.0},
     {"type": "Weight", "date": "2026-09-26", "value": 74.8},
     {"type": "Weight", "date": "2026-09-26", "value": 99.0},  # older entry, same day
     {"type": "Weight", "date": "2026-09-12", "value": 74.3},
@@ -68,12 +89,29 @@ ITEMS = [
 ]
 
 
-def test_v2_filters_type_and_dates_and_pages_until_past_start():
+def test_v2_asks_for_the_type_and_dates_and_pages():
     client = FakeClient(ITEMS)
-    got = get_measurements_v2(client, "weight", date(2026, 9, 1), date(2026, 9, 27))
+    got = get_measurements_v2(client, "Weight", date(2026, 9, 1), date(2026, 9, 27))
     assert got == {date(2026, 9, 26): 74.8, date(2026, 9, 12): 74.3}
-    # Stops at the page holding 2026-08-24 (< start): never fetches the 2021 entry.
-    assert client.session.offsets == [0, 2, 4]
+    assert client.session.queries[0] == {"types": "Weight", "from": "2026-09-01", "to": "2026-09-27"}
+    assert client.session.offsets == [0, 2]
+
+
+def test_v2_reads_types_other_than_weight():
+    # Without ``types`` the endpoint only returns Weight: Body Fat % came back empty.
+    client = FakeClient(ITEMS)
+    got = get_measurements_v2(client, "Body Fat %", date(2026, 9, 1), date(2026, 9, 30))
+    assert got == {date(2026, 9, 27): 18.0}
+
+
+def test_resolve_measurement_type_matches_the_account_names():
+    client = FakeClient(ITEMS)
+    assert resolve_measurement_type(client, "weight") == "Weight"
+    assert client.session.type_requests == 0
+    assert resolve_measurement_type(client, "body fat") == "Body Fat %"
+    assert resolve_measurement_type(client, "WAIST") == "Waist"
+    with pytest.raises(ValueError, match="Neck, Waist, Body Fat %"):
+        resolve_measurement_type(client, "Biceps")
 
 
 def test_v2_reaches_old_ranges_beyond_the_first_page():
