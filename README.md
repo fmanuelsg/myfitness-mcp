@@ -26,10 +26,17 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
 | `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
+| `mfp_log_fast` | Write | Log a completed intermittent fast |
+| `mfp_update_fast` | Write | Replace a logged fast's start and end |
+| `mfp_delete_fast` | Write | Delete a logged fast |
 
 ### Food collections (recent / frequent / my foods)
 
 `mfp_get_recent_foods`, `mfp_get_frequent_foods`, and `mfp_get_my_foods` each take an optional `limit` (recent/frequent default 10, my-foods default 100, max 100) and `response_format` (`markdown` or `json`). They intentionally use the **legacy add-to-diary AJAX endpoints** (`/food/load_recent`, `/food/load_most_used`, `/food/load_my_foods`) rather than the newer `/food/mine`, `/meal/mine`, or `/food/new` pages, which can redirect to `/account/logout` even when diary reads and API-token fetches still work.
+
+### Intermittent fasting
+
+`mfp_log_fast`, `mfp_update_fast` and `mfp_delete_fast` (ported from AdamWalt/myfitnesspal-mcp-python#16) write to `v2/diary/fasting_entry`. Times are ISO 8601; without an offset they are local time in the account's MyFitnessPal time zone (`location_preferences.time_zone`), and responses show them in that zone. MyFitnessPal has no endpoint to read fasts (GET is 405 and `v2/diary` does not list them), so the `id` returned by `mfp_log_fast` is the only way to update or delete a fast later.
 
 ### Editing diary entries
 
