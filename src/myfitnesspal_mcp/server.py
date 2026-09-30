@@ -865,6 +865,67 @@ class SetWaterInput(BaseModel):
 
 
 # ============================================================================
+# Food Search
+# ============================================================================
+
+LOGIN_PATH = "/account/login"
+
+
+class MfpSessionRejected(RuntimeError):
+    """MyFitnessPal redirected a page request to its login page."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "MyFitnessPal rejected the session (it redirected to its login "
+            "page). Reconnect MyFitnessPal and retry."
+        )
+
+
+def ensure_not_login(response) -> None:
+    """
+    Raise MfpSessionRejected if MyFitnessPal bounced the request to its login page.
+
+    When the site's session is no longer accepted, POST /food/search answers
+    with a 302 to /account/login. That page embeds the site's translations,
+    "Matching Foods:" among them, so checking for that text is not enough: the
+    login page used to pass as a search with no results.
+    """
+    from urllib.parse import urlsplit
+
+    if urlsplit(response.url).path.rstrip("/") == LOGIN_PATH:
+        raise MfpSessionRejected()
+
+
+def search_foods(client, query: str) -> list:
+    """
+    Search the food database like client.get_food_search_results(), but a
+    rejected session raises MfpSessionRejected instead of returning [].
+    """
+    import lxml.html
+
+    search_url = f"{client.BASE_URL_SECURE}food/search"
+    page = client.session.get(search_url)
+    ensure_not_login(page)
+    token = lxml.html.document_fromstring(page.content).xpath(
+        "(//input[@name='authenticity_token']/@value)[1]"
+    )
+    if not token:
+        raise RuntimeError("Could not find authenticity token on the search page")
+
+    response = client.session.post(search_url, data={
+        "authenticity_token": token[0],
+        "search": query,
+        "date": date.today().isoformat(),
+        "meal": "0",
+    })
+    ensure_not_login(response)
+    content = response.content.decode("utf8")
+    if "Matching Foods:" not in content:
+        raise RuntimeError("Unable to load search results.")
+    return client._get_food_search_results(lxml.html.document_fromstring(content))
+
+
+# ============================================================================
 # Diary Entry Creation Helper Functions
 # ============================================================================
 
@@ -1298,6 +1359,7 @@ def add_food_to_diary(
             "date": date_str,
             "page": "1",
         })
+        ensure_not_login(search_resp)
         search_html = search_resp.text
 
         # Find the link whose data-external-id matches mfp_id exactly.
@@ -2327,7 +2389,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
+        results = search_foods(client, params.query)
 
         # Limit results
         results = results[: params.limit]
