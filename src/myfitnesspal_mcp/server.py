@@ -1033,6 +1033,90 @@ def set_measurement_v2(client, measurement: str, value: float, day: date) -> Dic
     return entries[0]
 
 
+KJ_PER_KCAL = 4.184
+MACROS = ("carbohydrates", "protein", "fat")
+
+
+def macro_calories(goals: Dict[str, float]) -> float:
+    return 4 * goals["carbohydrates"] + 4 * goals["protein"] + 9 * goals["fat"]
+
+
+def new_goal_values(
+    current: Dict[str, float],
+    calories: Optional[float] = None,
+    protein: Optional[float] = None,
+    carbohydrates: Optional[float] = None,
+    fat: Optional[float] = None,
+) -> Dict[str, float]:
+    """
+    Goals to store (``calories`` and grams), from the current ones and what was asked.
+
+    Values not given stay as they are. Calories alone rescale the three macros,
+    keeping their share, as MFP's own form does. Calories are never raised to
+    match the macros: MFP accepts goals whose macros add up to a bit more.
+    """
+    asked = {"carbohydrates": carbohydrates, "protein": protein, "fat": fat}
+    if calories is not None and all(v is None for v in asked.values()) and current["calories"]:
+        scale = calories / current["calories"]
+        return {"calories": calories, **{m: round(current[m] * scale) for m in MACROS}}
+    new = {m: (asked[m] if asked[m] is not None else current[m]) for m in MACROS}
+    return {"calories": calories if calories is not None else current["calories"], **new}
+
+
+def _nutrient_goals_item(client, day: date) -> Dict[str, Any]:
+    response = client.session.get(
+        f"{client.BASE_API_URL}v2/nutrient-goals",
+        params={"date": day.isoformat()},
+        headers=mfp_api_headers(client),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch goals: HTTP {response.status_code}")
+    return response.json()["items"][0]
+
+
+def goals_from_item(item: Dict[str, Any]) -> Dict[str, float]:
+    """Calories and macro grams of a v2 nutrient-goals item (energy may be in kJ)."""
+    goal = item["default_goal"]
+    energy = float(goal["energy"]["value"])
+    if goal["energy"].get("unit") == "kilojoules":
+        energy /= KJ_PER_KCAL
+    return {"calories": round(energy), **{m: float(goal[m]) for m in MACROS}}
+
+
+def set_goals_v2(client, day: date, **asked: Optional[float]) -> Dict[str, float]:
+    """
+    Store new daily goals from ``day`` on and return them as MFP stored them.
+
+    Same request as python-myfitnesspal's set_new_goal() (the web's), which we
+    stopped using: it requires calories, recomputes all macros from percentages
+    unless the three are given, and raises the calories to what the macros add up to.
+    """
+    item = _nutrient_goals_item(client, day)
+    values = new_goal_values(goals_from_item(item), **asked)
+    unit = item["default_goal"]["energy"].get("unit") or "calories"
+    energy = values["calories"] * (KJ_PER_KCAL if unit == "kilojoules" else 1)
+
+    for key in ("valid_to", "default_group_id", "updated_at"):
+        item.pop(key, None)
+    item["valid_from"] = day.isoformat()
+    item["default_goal"]["meal_goals"] = []
+    for goal in [item["default_goal"], *item["daily_goals"]]:
+        goal.pop("group_id", None)
+        goal["meal_goals"] = []
+        goal["energy"] = {"value": energy, "unit": unit}
+        for macro in MACROS:
+            goal[macro] = values[macro]
+
+    response = client.session.post(
+        f"{client.BASE_API_URL}v2/nutrient-goals",
+        data=json.dumps({"item": item}),
+        headers=mfp_api_headers(client, json_body=True),
+    )
+    if not response.ok:
+        raise RuntimeError(f"Could not save goals: HTTP {response.status_code}")
+    return goals_from_item(_nutrient_goals_item(client, day))
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
 ) -> Dict[str, Any]:
@@ -2299,8 +2383,8 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     """
     Update daily nutrition goals (calories, protein, carbs, fat).
 
-    Sets new daily targets for the specified nutrients. Only updates the
-    values that are provided; others remain unchanged.
+    Sets new daily targets from today on. Values not provided stay as they
+    are, except that calories alone rescale the macros keeping their share.
 
     Args:
         params: SetGoalsInput containing:
@@ -2310,43 +2394,33 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
             - fat (int, optional): Daily fat goal in grams
 
     Returns:
-        str: Confirmation message with updated goals
+        str: The goals as stored by MyFitnessPal
     """
     try:
-        # Check that at least one goal is provided
-        if not any(
-            [params.calories, params.protein, params.carbohydrates, params.fat]
-        ):
+        asked = {
+            "calories": params.calories,
+            "protein": params.protein,
+            "carbohydrates": params.carbohydrates,
+            "fat": params.fat,
+        }
+        if all(v is None for v in asked.values()):
             return "Error: Please provide at least one goal to update (calories, protein, carbohydrates, or fat)"
 
         client = get_mfp_client()
+        stored = set_goals_v2(client, date.today(), **asked)
 
-        # Build kwargs for set_new_goal
-        kwargs = {}
-        if params.calories:
-            kwargs["energy"] = params.calories
-        if params.protein:
-            kwargs["protein"] = params.protein
-        if params.carbohydrates:
-            kwargs["carbohydrates"] = params.carbohydrates
-        if params.fat:
-            kwargs["fat"] = params.fat
-
-        client.set_new_goal(**kwargs)
-
-        return json.dumps(
-            {
-                "success": True,
-                "message": "Successfully updated nutrition goals",
-                "updated_goals": {
-                    "calories": params.calories,
-                    "protein": params.protein,
-                    "carbohydrates": params.carbohydrates,
-                    "fat": params.fat,
-                },
-            },
-            indent=2,
-        )
+        data: Dict[str, Any] = {
+            "success": True,
+            "message": "Successfully updated nutrition goals",
+            "goals": stored,
+        }
+        from_macros = macro_calories(stored)
+        if abs(from_macros - stored["calories"]) > 0.02 * stored["calories"]:
+            data["note"] = (
+                f"The macros add up to {round(from_macros)} kcal, "
+                f"not the {stored['calories']} kcal calorie goal"
+            )
+        return json.dumps(data, indent=2)
 
     except Exception as e:
         return f"Error setting goals: {str(e)}"
