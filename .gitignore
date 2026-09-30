@@ -225,3 +225,6 @@ tokens.json
 
 # Claude Code
 .claude/
+
+# uv: el lock lo genera cada ejecución local; los consumidores fijan el fork por commit
+uv.lock
