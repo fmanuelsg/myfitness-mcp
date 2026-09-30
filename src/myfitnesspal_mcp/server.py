@@ -890,6 +890,40 @@ def format_food_details(food: Dict[str, Any], mfp_id: str) -> Dict[str, Any]:
     }
 
 
+def get_measurements_v2(client, measurement: str, start: date, end: date) -> Dict[date, float]:
+    """
+    Measurements of one type between two dates (inclusive), from GET v2/measurements.
+
+    python-myfitnesspal's get_measurements() reads a "dehydratedState" blob that
+    MFP no longer serves to every session (KeyError on some, fine on others).
+    The v2 endpoint ignores its type/date filters and returns everything newest
+    first, 500 per page, paged with ``offset``: filter here and stop paging once
+    past ``start``. If a date has several entries, the newest one wins.
+
+    Ported from AdamWalt/myfitnesspal-mcp-python#21, plus paging.
+    """
+    wanted = measurement.strip().lower()
+    found: Dict[date, float] = {}
+    offset = 0
+    while True:
+        response = client.session.get(
+            f"{client.BASE_API_URL}v2/measurements",
+            params={"offset": offset} if offset else None,
+            headers=mfp_api_headers(client),
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Could not fetch measurements: HTTP {response.status_code}")
+        payload = response.json()
+        items = payload.get("items") or []
+        for item in items:
+            day = parse_date(item["date"])
+            if (item.get("type") or "").strip().lower() == wanted and start <= day <= end:
+                found.setdefault(day, float(item["value"]))
+        if not items or not payload.get("has_more") or parse_date(items[-1]["date"]) < start:
+            return found
+        offset += len(items)
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
 ) -> Dict[str, Any]:
@@ -1995,7 +2029,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = client.get_measurements(params.measurement, start, end)
+        measurements = get_measurements_v2(client, params.measurement, start, end)
         data = measurements_payload(measurements, params.measurement, start, end)
         return format_response(
             data, params.response_format, f"{params.measurement} History"
