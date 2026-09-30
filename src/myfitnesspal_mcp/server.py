@@ -1685,6 +1685,86 @@ def fetch_legacy_food_collection(
     return items[:limit]
 
 
+FREQUENT_FOODS_DAYS = 90
+
+
+def _food_name(food: Dict[str, Any]) -> str:
+    """'Brand - Description'; top_foods descriptions already start with the brand."""
+    brand, description = food.get("brand_name"), food.get("description") or ""
+    if not brand or description.startswith(f"{brand} - "):
+        return description
+    return f"{brand} - {description}"
+
+
+def fetch_frequent_foods(
+    client, limit: int, days: int = FREQUENT_FOODS_DAYS, today: Optional[date] = None
+) -> List[Dict[str, Any]]:
+    """
+    Foods logged most often in the last ``days`` days, from the web's top_foods route.
+
+    The legacy ``load_most_used`` endpoint times out on MFP's side (HTTP 504
+    after 60 s, 2026-09-30). top_foods is what the reports page uses for
+    "frequently logged foods": entries and calories per food over a range.
+    """
+    today = today or date.today()
+    response = client.session.get(
+        f"{client.BASE_URL_SECURE}api/services/top_foods?lists%5B%5D=energy",
+        params={"from": (today - timedelta(days=days - 1)).isoformat(), "to": today.isoformat()},
+        headers={"accept": "application/json"},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch frequent foods: HTTP {response.status_code}")
+    payload = response.json()
+    aggregates = (payload[0] if payload else {}).get("food_entry_aggregates") or []
+    aggregates = sorted(aggregates, key=lambda a: a.get("entries_total") or 0, reverse=True)
+    return [
+        {
+            "name": _food_name(a["food"]),
+            "description": a["food"].get("description"),
+            "brand_name": a["food"].get("brand_name"),
+            "times_logged": a.get("entries_total"),
+            "calories_per_entry": round(a["nutrient_total"] / a["entries_total"])
+            if a.get("entries_total")
+            else None,
+            "food_id": a["food"].get("id"),
+            "food_version": a["food"].get("version"),
+        }
+        for a in aggregates[:limit]
+    ]
+
+
+def fetch_my_foods(client, limit: int) -> List[Dict[str, Any]]:
+    """
+    Foods the account created, from the web's /api/services/users/foods/mine route.
+
+    Same foods as the legacy ``load_my_foods`` endpoint (checked 2026-09-30),
+    in 0.3 s instead of ~45 s.
+    """
+    response = client.session.get(
+        f"{client.BASE_URL_SECURE}api/services/users/foods/mine",
+        headers={"accept": "application/json"},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not fetch my foods: HTTP {response.status_code}")
+    items = []
+    for food in response.json()[:limit]:
+        serving = (food.get("serving_sizes") or [{}])[0]
+        energy = (food.get("nutritional_contents") or {}).get("energy") or {}
+        items.append(
+            {
+                "name": _food_name(food),
+                "description": food.get("description"),
+                "brand_name": food.get("brand_name"),
+                "serving": f"{serving.get('value', 1):g} {serving.get('unit', '')}".strip(),
+                "calories": energy.get("value"),
+                "public": food.get("public"),
+                "food_id": food.get("id"),
+                "food_version": food.get("version"),
+            }
+        )
+    return items
+
+
 def extract_diary_entry_ids(client, target_date: date) -> Dict[str, List[Optional[str]]]:
     """
     Extract entry IDs from the diary page, grouped by meal.
@@ -2154,10 +2234,9 @@ async def mfp_get_recent_foods(params: GetFoodCollectionInput) -> str:
 )
 async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
     """
-    Get most-used foods from MyFitnessPal.
+    Get the foods logged most often in the last 90 days.
 
-    This is backed by the legacy `load_most_used` endpoint exposed by the
-    add-to-diary page.
+    Returns how many times each was logged and its average calories per entry.
 
     Args:
         params: GetFoodCollectionInput containing:
@@ -2170,7 +2249,7 @@ async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
     try:
         client = get_mfp_client()
         limit = params.limit or 10
-        items = fetch_legacy_food_collection(client, category="frequent", limit=limit)
+        items = fetch_frequent_foods(client, limit)
         data = {
             "count": len(items),
             "limit": limit,
@@ -2193,11 +2272,7 @@ async def mfp_get_frequent_foods(params: GetFoodCollectionInput) -> str:
 )
 async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
     """
-    Get foods created or saved by the authenticated user.
-
-    This uses the legacy `load_my_foods` endpoint from the add-to-diary page,
-    which remains accessible even when the modern `My Foods` page redirects
-    away from authenticated sessions.
+    Get foods created by the authenticated user.
 
     Args:
         params: GetFoodCollectionInput containing:
@@ -2205,12 +2280,12 @@ async def mfp_get_my_foods(params: GetFoodCollectionInput) -> str:
             - response_format (str): 'markdown' or 'json'
 
     Returns:
-        str: List of foods created or saved by the account
+        str: List of foods created by the account
     """
     try:
         client = get_mfp_client()
         limit = params.limit or 100
-        items = fetch_legacy_food_collection(client, category="my_foods", limit=limit)
+        items = fetch_my_foods(client, limit)
         data = {
             "count": len(items),
             "limit": limit,
