@@ -9,6 +9,7 @@ from myfitnesspal_mcp.server import (
     get_measurements_v2,
     measurements_payload,
     resolve_measurement_type,
+    set_measurement_v2,
 )
 
 
@@ -119,3 +120,60 @@ def test_v2_reaches_old_ranges_beyond_the_first_page():
     assert get_measurements_v2(client, "Weight", date(2021, 1, 1), date(2021, 12, 31)) == {
         date(2021, 5, 5): 80.0
     }
+
+
+class WritableSession(PagedSession):
+    """The web's write routes: the weight upsert (MFP keeps it in pounds and serves
+    it back in the account's unit) and the PUT for other types."""
+
+    def __init__(self, items, store=True):
+        super().__init__(items)
+        self.puts, self.store = [], store
+
+    def put(self, url, json=None, headers=None):
+        self.puts.append((url.removeprefix("https://www.myfitnesspal.com/api/"), json))
+        if self.store:
+            if "upsert" in url:
+                item = json["item"]
+                self.items.insert(0, {"id": "1", "type": "Weight", "value": item["value"],
+                                      "unit": item["unit"], "date": item["entry_date"]})
+            else:
+                self.items.insert(0, {"id": "2", **json["items"][0]})
+        return FakeResponse({})
+
+
+def writable_client(unit="kilograms", store=True):
+    client = FakeClient([])
+    client.session = WritableSession([], store=store)
+    client.user_metadata = {"unit_preferences": {"weight": unit}}
+    return client
+
+
+def test_set_weight_uses_the_upsert_in_the_account_unit_and_returns_what_was_stored():
+    client = writable_client()
+    stored = set_measurement_v2(client, "Weight", 73.4, date(2026, 9, 30))
+    assert client.session.puts == [
+        ("services/incubator/measurements/upsert",
+         {"item": {"entry_date": "2026-09-30", "unit": "kilograms", "value": 73.4, "type": "weight"}})
+    ]
+    assert stored == {"id": "1", "type": "Weight", "value": 73.4, "unit": "kilograms", "date": "2026-09-30"}
+
+
+def test_set_weight_in_stones_accounts_is_sent_in_pounds():
+    client = writable_client(unit="stones")
+    set_measurement_v2(client, "Weight", 160, date(2026, 9, 30))
+    assert client.session.puts[0][1]["item"]["unit"] == "pounds"
+
+
+def test_set_other_types_uses_the_measurements_put():
+    client = writable_client()
+    stored = set_measurement_v2(client, "Waist", 80, date(2026, 9, 30))
+    assert client.session.puts == [
+        ("user-measurements/measurements", {"items": [{"type": "Waist", "value": 80, "date": "2026-09-30"}]})
+    ]
+    assert stored["id"] == "2" and stored["value"] == 80
+
+
+def test_set_measurement_fails_if_it_does_not_show_up():
+    with pytest.raises(RuntimeError, match="not in the account"):
+        set_measurement_v2(writable_client(store=False), "Weight", 73.4, date(2026, 9, 30))
