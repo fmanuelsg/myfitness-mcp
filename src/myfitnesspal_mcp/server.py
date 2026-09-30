@@ -23,12 +23,14 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from enum import Enum
 from http.cookiejar import CookieJar
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
@@ -3366,6 +3368,236 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
     except Exception as e:
         return f"Error getting report: {str(e)}"
+
+
+# ============================================================================
+# Intermittent fasting (write-only)
+# ============================================================================
+#
+# Ported from AdamWalt/myfitnesspal-mcp-python#16. v2/diary/fasting_entry takes
+# POST (create, 201), PATCH /{id} (full replacement of both times, 204) and
+# DELETE /{id} (204); an unknown id is 404 "fasting entry not found". There is
+# no read: GET is 405, v2/diary rejects the type and does not list fasts
+# (checked 2026-09-30). MFP stores UTC; times without an offset are taken in
+# the account's time zone (location_preferences.time_zone).
+
+FASTING_PATH = "v2/diary/fasting_entry"
+_FASTING_ID_PATTERN = r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+
+
+def account_time_zone(client) -> Optional[ZoneInfo]:
+    """The profile's time zone (location_preferences.time_zone), or None."""
+    name = ((getattr(client, "user_metadata", None) or {}).get("location_preferences") or {}).get("time_zone")
+    try:
+        return ZoneInfo(name) if name else None
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+
+
+def parse_fasting_time(text: str, tz: Optional[ZoneInfo]) -> datetime:
+    """ISO 8601 time -> aware UTC datetime; without an offset it is local time in ``tz``."""
+    try:
+        parsed = datetime.fromisoformat(text.strip())
+    except ValueError:
+        raise ValueError(f"Not an ISO 8601 date and time: {text!r} (e.g. 2026-09-30T08:00)") from None
+    if parsed.tzinfo is None:
+        if tz is None:
+            raise ValueError(
+                "The MyFitnessPal profile has no usable time zone; give the times with "
+                "an offset (e.g. 2026-09-30T08:00+02:00)."
+            )
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed.astimezone(ZoneInfo("UTC"))
+
+
+def fasting_payload(entry_id: str, started: datetime, ended: datetime) -> Dict[str, Any]:
+    if ended <= started:
+        raise ValueError("The fast must end after it starts.")
+    return {
+        "items": [
+            {
+                "type": "fasting_entry",
+                "id": entry_id,
+                "fast_started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "fast_ended": ended.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        ]
+    }
+
+
+def format_fast(entry_id: str, started: datetime, ended: datetime, tz: ZoneInfo) -> Dict[str, Any]:
+    return {
+        "id": entry_id,
+        "fast_started": started.astimezone(tz).isoformat(),
+        "fast_ended": ended.astimezone(tz).isoformat(),
+        "time_zone": tz.key,
+        "duration_hours": round((ended - started).total_seconds() / 3600, 2),
+    }
+
+
+def _fasting_error(response, entry_id: str, action: str) -> RuntimeError:
+    if response.status_code == 404:
+        return RuntimeError(
+            f"No fast with id {entry_id}. MyFitnessPal cannot list fasts: ids come from mfp_log_fast."
+        )
+    return RuntimeError(f"Could not {action} the fast: HTTP {response.status_code} {response.text[:200]}")
+
+
+def write_fast(
+    client, fast_started: str, fast_ended: str, entry_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create (no ``entry_id``) or replace a fasting entry; returns it in the account's time zone."""
+    tz = account_time_zone(client)
+    started, ended = parse_fasting_time(fast_started, tz), parse_fasting_time(fast_ended, tz)
+    new = entry_id is None
+    entry_id = entry_id or str(uuid.uuid4()).upper()
+    body = json.dumps(fasting_payload(entry_id, started, ended))
+    headers = mfp_api_headers(client, json_body=True)
+    if new:
+        response = client.session.post(f"{client.BASE_API_URL}{FASTING_PATH}", data=body, headers=headers)
+        if response.status_code != 201:
+            raise _fasting_error(response, entry_id, "log")
+    else:
+        response = client.session.patch(
+            f"{client.BASE_API_URL}{FASTING_PATH}/{entry_id}", data=body, headers=headers
+        )
+        if response.status_code != 204:
+            raise _fasting_error(response, entry_id, "update")
+    return format_fast(entry_id, started, ended, tz or ZoneInfo("UTC"))
+
+
+def delete_fast(client, entry_id: str) -> Dict[str, Any]:
+    response = client.session.delete(
+        f"{client.BASE_API_URL}{FASTING_PATH}/{entry_id}", headers=mfp_api_headers(client)
+    )
+    if response.status_code != 204:
+        raise _fasting_error(response, entry_id, "delete")
+    return {"id": entry_id, "deleted": True}
+
+
+_FAST_TIME_HELP = (
+    "ISO 8601 date and time, e.g. '2026-09-29T20:00'. Without an offset it is local "
+    "time in the account's MyFitnessPal time zone; with one ('...+02:00', '...Z') it is converted."
+)
+
+
+class LogFastInput(BaseModel):
+    """Input model for logging a completed fast."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    fast_started: str = Field(..., description=f"Start of the fast. {_FAST_TIME_HELP}")
+    fast_ended: str = Field(..., description=f"End of the fast, after the start. {_FAST_TIME_HELP}")
+
+
+class UpdateFastInput(LogFastInput):
+    """Input model for replacing a fast's times."""
+
+    id: str = Field(..., description="Fast id returned by mfp_log_fast.", pattern=_FASTING_ID_PATTERN)
+
+
+class DeleteFastInput(BaseModel):
+    """Input model for deleting a fast."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    id: str = Field(..., description="Fast id returned by mfp_log_fast.", pattern=_FASTING_ID_PATTERN)
+
+
+@mcp.tool(
+    name="mfp_log_fast",
+    annotations={
+        "title": "Log Intermittent Fast",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_log_fast(params: LogFastInput) -> str:
+    """
+    Log a completed intermittent fast (start and end time) in MyFitnessPal.
+
+    MyFitnessPal offers no way to read fasts back, so existing fasts are not
+    visible here and the returned `id` is the only handle for mfp_update_fast
+    and mfp_delete_fast: keep it. Logging the same fast twice creates two.
+
+    Args:
+        params: LogFastInput containing:
+            - fast_started (str): start, ISO 8601; local time in the account's
+              time zone unless an offset is given
+            - fast_ended (str): end, same format
+
+    Returns:
+        str: JSON with the id, both times in the account's time zone and the duration
+    """
+    try:
+        client = get_mfp_client()
+        return json.dumps({"success": True, **write_fast(client, params.fast_started, params.fast_ended)}, indent=2)
+    except Exception as e:
+        return f"Error logging fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_update_fast",
+    annotations={
+        "title": "Update Intermittent Fast",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_update_fast(params: UpdateFastInput) -> str:
+    """
+    Replace the start and end time of a fast logged with mfp_log_fast.
+
+    Both times are required, even if only one changes: MyFitnessPal replaces
+    both and fasts cannot be read back.
+
+    Args:
+        params: UpdateFastInput containing:
+            - id (str): id returned by mfp_log_fast
+            - fast_started (str): new start, ISO 8601 (see mfp_log_fast)
+            - fast_ended (str): new end, same format
+
+    Returns:
+        str: JSON with the fast as saved
+    """
+    try:
+        client = get_mfp_client()
+        fast = write_fast(client, params.fast_started, params.fast_ended, entry_id=params.id.upper())
+        return json.dumps({"success": True, **fast}, indent=2)
+    except Exception as e:
+        return f"Error updating fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_fast",
+    annotations={
+        "title": "Delete Intermittent Fast",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_fast(params: DeleteFastInput) -> str:
+    """
+    Delete a fast logged with mfp_log_fast, by its id. Not recoverable.
+
+    Args:
+        params: DeleteFastInput containing:
+            - id (str): id returned by mfp_log_fast
+
+    Returns:
+        str: JSON confirming the deleted id
+    """
+    try:
+        client = get_mfp_client()
+        return json.dumps({"success": True, **delete_fast(client, params.id.upper())}, indent=2)
+    except Exception as e:
+        return f"Error deleting fast: {str(e)}"
 
 
 # ============================================================================

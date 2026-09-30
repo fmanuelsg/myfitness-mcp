@@ -27,12 +27,19 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
 | `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
+| `mfp_log_fast` | Write | Log a completed intermittent fast |
+| `mfp_update_fast` | Write | Replace a logged fast's start and end |
+| `mfp_delete_fast` | Write | Delete a logged fast |
 
 ### Food collections (recent / frequent / my foods)
 
 `mfp_get_recent_foods`, `mfp_get_frequent_foods`, and `mfp_get_my_foods` each take an optional `limit` (recent/frequent default 10, my-foods default 100, max 100) and `response_format` (`markdown` or `json`); `mfp_get_my_foods` also takes `search`. Frequent foods come from the web's `/api/services/top_foods` (last 90 days) and my foods from `/api/services/users/foods/mine`; recent foods still use the legacy `/food/load_recent` AJAX endpoint, which can take ~45 s.
 
 `mfp_delete_custom_food` deletes one of the account's own foods by the `food_id` that `mfp_get_my_foods` returns (`DELETE /api/services/foods/{id}`, ported from AdamWalt/myfitnesspal-mcp-python). Other ids are refused before anything is sent. Diary entries already logged with the food keep their name and nutrition.
+
+### Intermittent fasting
+
+`mfp_log_fast`, `mfp_update_fast` and `mfp_delete_fast` (ported from AdamWalt/myfitnesspal-mcp-python#16) write to `v2/diary/fasting_entry`. Times are ISO 8601; without an offset they are local time in the account's MyFitnessPal time zone (`location_preferences.time_zone`), and responses show them in that zone. MyFitnessPal has no endpoint to read fasts (GET is 405 and `v2/diary` does not list them), so the `id` returned by `mfp_log_fast` is the only way to update or delete a fast later.
 
 ### Editing diary entries
 
