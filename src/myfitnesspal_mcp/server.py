@@ -796,6 +796,69 @@ class SetWaterInput(BaseModel):
 # ============================================================================
 
 
+def mfp_api_headers(client, json_body: bool = False) -> Dict[str, str]:
+    """Auth headers for MyFitnessPal's v2 JSON API (the one the web client uses)."""
+    headers = {
+        "authorization": f"Bearer {client.access_token}",
+        "mfp-client-id": "mfp-main-js",
+        "mfp-user-id": str(client.user_id),
+        "accept": "application/json",  # required; without it the edge returns 400 "Illegal request"
+    }
+    if json_body:
+        headers["content-type"] = "application/json"
+    return headers
+
+
+def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
+    """
+    Fetch a food's v2 record: description, brand, nutritional_contents and
+    serving_sizes.
+
+    python-myfitnesspal's get_food_item_details() scrapes a food page that is
+    now client-rendered and raises a KeyError ('fiber', 'trans_fat', ...) on
+    most foods. The v2 endpoint is what that page itself calls.
+
+    Ported from AdamWalt/myfitnesspal-mcp-python#20.
+
+    Raises:
+        RuntimeError: If the food cannot be retrieved
+    """
+    response = client.session.get(
+        f"{client.BASE_API_URL}v2/foods",
+        params={"ids": str(mfp_id)},
+        headers=mfp_api_headers(client),
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not look up food {mfp_id}: HTTP {response.status_code}")
+    items = response.json().get("items") or []
+    if not items:
+        raise RuntimeError(f"No food found with ID {mfp_id}")
+    return items[0]
+
+
+_FOOD_NUTRIENTS = (
+    "protein", "carbohydrates", "fat", "fiber", "sugar", "sodium", "cholesterol",
+    "saturated_fat", "polyunsaturated_fat", "monounsaturated_fat", "trans_fat",
+    "potassium", "vitamin_a", "vitamin_c", "calcium", "iron",
+)
+
+
+def format_food_details(food: Dict[str, Any], mfp_id: str) -> Dict[str, Any]:
+    """mfp_get_food_details output from a v2 food record (see get_food_v2)."""
+    nutrition = food.get("nutritional_contents") or {}
+    return {
+        "mfp_id": mfp_id,
+        "description": food.get("description", "N/A"),
+        "brand_name": food.get("brand_name") or None,
+        "verified": food.get("verified", False),
+        "calories": (nutrition.get("energy") or {}).get("value"),
+        # nutrition values are per this many grams of the food, when MFP knows it
+        "nutrition_basis_grams": nutrition.get("grams"),
+        "nutrition": {name: nutrition.get(name) for name in _FOOD_NUTRIENTS},
+        "servings": [f"{s['value']:g} {s['unit']}" for s in food.get("serving_sizes") or []],
+    }
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
 ) -> Dict[str, Any]:
@@ -860,9 +923,9 @@ def add_food_to_diary(
         # Step 3: Get the food's name so we can search for it.
         # MFP's search box doesn't accept mfp_ids directly -- only names.
         try:
-            food_item = client.get_food_item_details(mfp_id)
-            brand = getattr(food_item, "brand", "") or ""
-            name = getattr(food_item, "name", "") or ""
+            food = get_food_v2(client, mfp_id)
+            brand = food.get("brand_name") or ""
+            name = food.get("description") or ""
             search_query = f"{brand} {name}".strip() or str(mfp_id)
         except Exception as details_err:
             # If we can't resolve the food's name, the id may simply be
@@ -1750,40 +1813,7 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
     """
     try:
         client = get_mfp_client()
-        item = client.get_food_item_details(params.mfp_id)
-
-        data = {
-            "mfp_id": params.mfp_id,
-            "description": getattr(item, "description", "N/A"),
-            "brand_name": getattr(item, "brand_name", None),
-            "verified": getattr(item, "verified", False),
-            "calories": getattr(item, "calories", None),
-            "nutrition": {
-                "protein": getattr(item, "protein", None),
-                "carbohydrates": getattr(item, "carbohydrates", None),
-                "fat": getattr(item, "fat", None),
-                "fiber": getattr(item, "fiber", None),
-                "sugar": getattr(item, "sugar", None),
-                "sodium": getattr(item, "sodium", None),
-                "cholesterol": getattr(item, "cholesterol", None),
-                "saturated_fat": getattr(item, "saturated_fat", None),
-                "polyunsaturated_fat": getattr(item, "polyunsaturated_fat", None),
-                "monounsaturated_fat": getattr(item, "monounsaturated_fat", None),
-                "trans_fat": getattr(item, "trans_fat", None),
-                "potassium": getattr(item, "potassium", None),
-                "vitamin_a": getattr(item, "vitamin_a", None),
-                "vitamin_c": getattr(item, "vitamin_c", None),
-                "calcium": getattr(item, "calcium", None),
-                "iron": getattr(item, "iron", None),
-            },
-            "servings": [],
-        }
-
-        # Get serving sizes if available
-        if hasattr(item, "servings"):
-            for serving in item.servings:
-                data["servings"].append(str(serving))
-
+        data = format_food_details(get_food_v2(client, params.mfp_id), params.mfp_id)
         return format_response(data, params.response_format, "Food Item Details")
 
     except Exception as e:
@@ -2255,13 +2285,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
         )
         meal = entry["meal"]
-
-        # Get food details for confirmation
-        try:
-            food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
-        except Exception:
-            food_name = "Food item"
+        # The diary entry read back after the add, e.g. "Chicken Breast, 4 oz".
+        food_name = entry.get("name") or "Food item"
 
         return json.dumps(
             {
@@ -2425,15 +2450,10 @@ def create_food(
     if share_public:
         item["public"] = True
 
-    headers = {
-        "authorization": f"Bearer {client.access_token}",
-        "mfp-client-id": "mfp-main-js",
-        "mfp-user-id": str(client.user_id),
-        "content-type": "application/json",
-        "accept": "application/json",  # required; without it the edge returns 400 "Illegal request"
-    }
     url = f"{client.BASE_API_URL}v2/foods"
-    resp = client.session.post(url, data=json.dumps({"item": item}), headers=headers)
+    resp = client.session.post(
+        url, data=json.dumps({"item": item}), headers=mfp_api_headers(client, json_body=True)
+    )
     if not resp.ok:
         raise RuntimeError(
             f"MyFitnessPal API rejected the new food (HTTP {resp.status_code}): "
