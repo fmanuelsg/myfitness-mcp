@@ -690,13 +690,22 @@ class AddFoodToDiaryInput(BaseModel):
     quantity: float = Field(
         default=1.0,
         description=(
-            "Quantity in number of default servings (e.g., 1.5 for 1.5 servings). "
-            "The 'default serving' is the first weight option for the food in "
-            "MyFitnessPal -- call mfp_get_food_details(mfp_id) to see what the "
-            "default unit actually is for any given food."
+            "Without `unit`: number of default servings (e.g., 1.5; the default "
+            "serving is the first one mfp_get_food_details lists). With `unit`: the "
+            "literal amount of that unit (e.g., 150 with unit 'g' logs 150 g)."
         ),
         gt=0,
         le=10000,
+    )
+    unit: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional unit to log `quantity` in: 'g', 'oz', 'ml', 'cup'... (English or "
+            "Spanish), or a full serving label from mfp_get_food_details such as "
+            "'1 container (1000 mls ea.)', in which case `quantity` counts that serving. "
+            "A unit the food does not have is an error listing its servings."
+        ),
+        min_length=1,
     )
 
 
@@ -773,13 +782,21 @@ class UpdateFoodEntryInput(BaseModel):
     )
     quantity: Optional[float] = Field(
         default=None,
-        description="New quantity/servings.",
+        description=(
+            "New number of servings, or the literal amount of `unit` when `unit` is a "
+            "bare unit such as 'g'."
+        ),
         gt=0,
-        le=100,
+        le=10000,
     )
     unit: Optional[str] = Field(
         default=None,
-        description="New serving size label exactly as shown by MyFitnessPal (for example '350 ml').",
+        description=(
+            "New serving: a bare unit ('g', 'oz', 'ml'...; requires `quantity`, the "
+            "amount of that unit), or a full serving label as MyFitnessPal shows it "
+            "(e.g. '350 ml'; `quantity` then counts that serving). Changing the "
+            "serving requires `quantity`."
+        ),
     )
     weight_id: Optional[str] = Field(
         default=None,
@@ -1153,7 +1170,12 @@ def get_report_values(
 
 
 def add_food_to_diary(
-    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0,
+    client,
+    mfp_id: str,
+    meal: str,
+    target_date: date,
+    quantity: float = 1.0,
+    unit: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Add a food item to the diary for a specific date and meal.
@@ -1165,10 +1187,13 @@ def add_food_to_diary(
       2. POST /food/search to find the food and capture its `data-original-id`
          + `data-weight-ids` + the page's csrf-token meta
       3. POST /food/add with food_entry[food_id]=original_id (NOT mfp_id),
-         food_entry[meal_id]=index, food_entry[weight_id]=first weight id
+         food_entry[meal_id]=index, food_entry[weight_id]=chosen weight id
 
-    The food's default weight_id (first one MFP exposes for the food) is
-    always used. The quantity is in units of that default serving.
+    Without ``unit``, the food's default serving (the first weight id) is used
+    and ``quantity`` counts those servings. With ``unit``, the serving is
+    chosen by choose_serving() from the food's v2 serving_sizes, which come in
+    the same order as the search result's data-weight-ids (checked on 48 foods,
+    2026-09-30); the v2 ids themselves are a different id space.
 
     The meal is resolved against the account's own meals (see resolve_meal)
     before anything is written; unknown names raise ValueError. After the
@@ -1185,7 +1210,9 @@ def add_food_to_diary(
         meal: Meal name as configured in the account, or an English/Spanish
             alias of a default meal (Breakfast/Desayuno, Dinner/Cena, ...)
         target_date: Date to add the food entry
-        quantity: Number of default servings (default 1.0)
+        quantity: Number of default servings (default 1.0), or the amount of
+            ``unit`` when given
+        unit: Optional unit or serving label (see choose_serving)
 
     Returns:
         The confirmed diary entry (as in mfp_get_diary), including its
@@ -1215,12 +1242,17 @@ def add_food_to_diary(
 
         # Step 3: Get the food's name so we can search for it.
         # MFP's search box doesn't accept mfp_ids directly -- only names.
+        food = None
         try:
             food = get_food_v2(client, mfp_id)
             brand = food.get("brand_name") or ""
             name = food.get("description") or ""
             search_query = f"{brand} {name}".strip() or str(mfp_id)
         except Exception as details_err:
+            if unit:
+                raise RuntimeError(
+                    f"Could not read the servings of food {mfp_id} to log it by unit: {details_err}"
+                )
             # If we can't resolve the food's name, the id may simply be
             # invalid. Continue with the id as the query so the search step
             # gives a clean "no results" error, which is more actionable
@@ -1276,6 +1308,19 @@ def add_food_to_diary(
             )
         original_id = link_match.group(1)
         weight_ids = link_match.group(2).split(",")
+        weight_id, servings = weight_ids[0], quantity
+        if unit:
+            sizes = sorted(food.get("serving_sizes") or [], key=lambda s: s.get("index", 0))
+            if len(sizes) != len(weight_ids):
+                raise RuntimeError(
+                    f"The servings of food {mfp_id} do not line up with MyFitnessPal's "
+                    f"serving ids ({len(sizes)} vs {len(weight_ids)}); log it without "
+                    "`unit` and fix the serving with mfp_update_food_entry."
+                )
+            index, servings = choose_serving(
+                [(float(s["value"]), s["unit"]) for s in sizes], unit, quantity
+            )
+            weight_id = weight_ids[index]
 
         # CSRF tokens from the search results page
         page_csrf_match = re.search(
@@ -1296,8 +1341,8 @@ def add_food_to_diary(
             "authenticity_token": results_auth,
             "food_entry[food_id]": original_id,
             "food_entry[date]": date_str,
-            "food_entry[quantity]": str(quantity),
-            "food_entry[weight_id]": weight_ids[0],
+            "food_entry[quantity]": f"{servings:g}",
+            "food_entry[weight_id]": weight_id,
             "food_entry[meal_id]": meal_index,
         }
         headers = {
@@ -1325,7 +1370,7 @@ def add_food_to_diary(
             f"Add failed: HTTP {response.status_code} -> {loc or '(no redirect)'}"
         )
 
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         raise
     except Exception as e:
         raise RuntimeError(f"Failed to add food to diary: {e}")
@@ -1834,24 +1879,116 @@ def get_edit_entry_form(client, entry_id: str):
     return edit_url, forms[0]
 
 
-def resolve_weight_id(form, weight_id: Optional[str], unit: Optional[str]) -> str:
-    """Resolve the serving-size option to submit back to MyFitnessPal."""
-    selected = form.xpath(".//select[@name='food_entry[weight_id]']/option[@selected='selected']/@value")
+# Spellings MFP foods use for the same unit (seen in search results, 2026-09-30:
+# "g", "gram", "gramo", "grs", "ounce", "kg(s)", "ml(s)", "milliliter", ...),
+# plus English/Spanish words an assistant may pass. Keys and aliases are _fold()ed.
+_UNIT_ALIASES = {
+    "g": ("g", "gr", "grs", "gm", "gms", "gram", "grams", "gramo", "gramos"),
+    "kg": ("kg", "kgs", "kilo", "kilos", "kilogram", "kilograms", "kilogramo", "kilogramos"),
+    "mg": ("mg", "mgs", "milligram", "milligrams", "miligramo", "miligramos"),
+    "oz": ("oz", "ounce", "ounces", "onza", "onzas"),
+    "lb": ("lb", "lbs", "pound", "pounds", "libra", "libras"),
+    "ml": ("ml", "mls", "milliliter", "milliliters", "millilitre", "millilitres", "mililitro", "mililitros"),
+    "l": ("l", "liter", "liters", "litre", "litres", "litro", "litros"),
+    "fl oz": ("fl oz", "fluid ounce", "fluid ounces"),
+    "cup": ("cup", "cups", "taza", "tazas"),
+    "tbsp": ("tbsp", "tbsps", "tablespoon", "tablespoons", "cucharada", "cucharadas"),
+    "tsp": ("tsp", "tsps", "teaspoon", "teaspoons", "cucharadita", "cucharaditas"),
+}
+_CANONICAL_UNIT = {alias: canonical for canonical, aliases in _UNIT_ALIASES.items() for alias in aliases}
+# Words for "the food's default serving", used when no serving has that unit.
+_DEFAULT_SERVING_WORDS = ("serving", "servings", "racion", "raciones", "porcion", "porciones")
+
+
+def _unit_key(unit: str) -> str:
+    """Comparable form of a serving unit: 'kg(s)' -> 'kg', 'g (1 yogur)' -> 'g', 'Gramos' -> 'g'."""
+    text = _fold(unit).replace("(s)", "")
+    text = re.sub(r"\(.*?\)", "", text)
+    text = " ".join(text.replace(".", " ").split())
+    return _CANONICAL_UNIT.get(text, text)
+
+
+def serving_label(value: float, unit: str) -> str:
+    return f"{value:g} {unit}"
+
+
+def parse_serving_label(label: str) -> Tuple[float, str]:
+    """'100 ml' -> (100.0, 'ml'); '1/2 cup' -> (0.5, 'cup'); a label without a number counts as 1."""
+    label = " ".join(label.split())
+    match = re.match(r"^(\d+(?:[.,]\d+)?)(?:/(\d+))?\s+(.+)$", label)
+    if not match:
+        return 1.0, label
+    value = float(match.group(1).replace(",", "."))
+    if match.group(2):
+        value /= float(match.group(2))
+    return value, match.group(3)
+
+
+def choose_serving(
+    servings: List[Tuple[float, str]], unit: str, quantity: Optional[float]
+) -> Tuple[int, Optional[float]]:
+    """
+    Pick the serving to log ``quantity`` of ``unit`` against, and how many of
+    those servings to send to MyFitnessPal.
+
+    * A full serving label ('100 ml', '1 container (1000 mls ea.)') selects that
+      serving; ``quantity`` counts servings, as before.
+    * A bare unit ('g', 'gramos', 'oz') makes ``quantity`` a literal amount of
+      that unit. Among servings with that unit the one of value 1 wins, so 10 g
+      is 10 x '1 g' and never 10 x '100 g' (AdamWalt/myfitnesspal-mcp-python#18).
+      Without one, the amount is divided: 150 g against '100 g' is 1.5 servings.
+    * 'serving'/'ración' falls back to the default (first) serving.
+
+    ``servings`` are (value, unit) pairs in MyFitnessPal's order. Raises
+    ValueError, listing them, when nothing matches: a serving is never picked
+    blindly.
+    """
+    labels = [serving_label(value, name) for value, name in servings]
+    for index, label in enumerate(labels):
+        if _fold(label) == _fold(unit):
+            return index, quantity
+
+    key = _unit_key(unit)
+    matches = [index for index, (_, name) in enumerate(servings) if _unit_key(name) == key]
+    if not matches and _fold(unit) in _DEFAULT_SERVING_WORDS and servings:
+        return 0, quantity
+    if not matches:
+        raise ValueError(
+            f"This food has no '{unit}' serving. Available: {', '.join(labels) or 'none'}."
+        )
+    if quantity is None:
+        raise ValueError(f"Give a quantity with unit '{unit}': the amount of {unit} to log.")
+    index = next((i for i in matches if servings[i][0] == 1), matches[0])
+    return index, round(quantity / servings[index][0], 4)
+
+
+def resolve_entry_serving(
+    form, weight_id: Optional[str], unit: Optional[str], quantity: Optional[float]
+) -> Tuple[str, str]:
+    """
+    weight_id and quantity to submit back to MyFitnessPal for an edited entry.
+
+    Changing the serving requires a quantity: keeping the old number would turn
+    250 x '1 ml' into 250 x '1 cup'.
+    """
+    options = form.xpath(".//select[@name='food_entry[weight_id]']/option")
+    selected = [o for o in options if o.attrib.get("selected") == "selected"] or options[:1]
+    current = selected[0].attrib["value"] if selected else None
     if weight_id:
-        return weight_id
-    if unit:
-        wanted = " ".join(unit.split()).lower()
-        for option in form.xpath(".//select[@name='food_entry[weight_id]']/option"):
-            label = " ".join("".join(option.itertext()).split()).lower()
-            if label == wanted:
-                return option.attrib["value"]
-        raise RuntimeError(f"Serving size '{unit}' was not available for this entry")
-    if selected:
-        return selected[0]
-    first_option = form.xpath(".//select[@name='food_entry[weight_id]']/option[1]/@value")
-    if not first_option:
+        chosen = weight_id
+    elif unit:
+        servings = [parse_serving_label("".join(option.itertext())) for option in options]
+        index, quantity = choose_serving(servings, unit, quantity)
+        chosen = options[index].attrib["value"]
+    elif current:
+        chosen = current
+    else:
         raise RuntimeError("Could not determine a serving size for this entry")
-    return first_option[0]
+    if quantity is None:
+        if chosen != current:
+            raise ValueError("Give a quantity when changing the serving size.")
+        return chosen, (form.xpath(".//input[@name='food_entry[quantity]']/@value") or ["1"])[0]
+    return chosen, f"{quantity:g}"
 
 
 def find_replacement_entry(
@@ -1926,12 +2063,15 @@ def update_food_entry(
         result = form.xpath(xpath)
         return result[0] if result else default
 
+    chosen_weight_id, chosen_quantity = resolve_entry_serving(
+        form, weight_id=weight_id, unit=unit, quantity=quantity
+    )
     payload = {
         "authenticity_token": val(".//input[@name='authenticity_token']/@value"),
         "food_entry[id]": val(".//input[@name='food_entry[id]']/@value"),
         "food_entry[date]": target_date.strftime("%Y-%m-%d"),
-        "food_entry[quantity]": str(quantity if quantity is not None else val(".//input[@name='food_entry[quantity]']/@value")),
-        "food_entry[weight_id]": resolve_weight_id(form, weight_id=weight_id, unit=unit),
+        "food_entry[quantity]": chosen_quantity,
+        "food_entry[weight_id]": chosen_weight_id,
         "food_entry[meal_id]": meal_id if meal_id is not None else val(".//select[@name='food_entry[meal_id]']/option[@selected='selected']/@value"),
     }
 
@@ -2592,10 +2732,13 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             - meal (str): Meal name as shown in the account's diary, or an English/Spanish
               alias of a default meal (default: 'Breakfast'). Unknown names are an error.
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - quantity (float): Number of default servings for this food (default: 1.0)
+            - quantity (float): Number of default servings (default: 1.0), or the
+              amount of `unit` when given
+            - unit (str, optional): Unit to log `quantity` in ('g', 'oz', 'ml'...)
+              or a full serving label
 
     Returns:
-        str: Confirmation message with details of the added food entry
+        str: Confirmation message with the entry as read back from the diary
     """
     try:
         client = get_mfp_client()
@@ -2607,6 +2750,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             meal=params.meal,
             target_date=target_date,
             quantity=params.quantity,
+            unit=params.unit,
         )
         meal = entry["meal"]
         # The diary entry read back after the add, e.g. "Chicken Breast, 4 oz".
@@ -2622,7 +2766,9 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
                 "entry_id": entry.get("entry_id"),
                 "food_id": params.mfp_id,
                 "food_name": food_name,
-                "quantity": params.quantity,
+                # As MyFitnessPal stored it (e.g. 150 g), read back from the diary.
+                "quantity": entry.get("quantity"),
+                "unit": entry.get("unit"),
             },
             indent=2,
         )
@@ -2918,8 +3064,9 @@ async def mfp_update_food_entry(params: UpdateFoodEntryInput) -> str:
             - entry_id (str): Diary entry ID from mfp_get_diary JSON output
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
             - meal (str, optional): New meal name
-            - quantity (float, optional): New number of servings
-            - unit (str, optional): New serving-size label
+            - quantity (float, optional): New number of servings, or the amount of
+              `unit` when it is a bare unit
+            - unit (str, optional): Bare unit ('g', 'oz'...) or full serving label
             - weight_id (str, optional): Raw MFP serving-size option ID
 
     Returns:

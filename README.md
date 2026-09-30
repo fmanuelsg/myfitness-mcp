@@ -35,8 +35,16 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 
 `mfp_get_diary` with `response_format=json` now surfaces an `entry_id` for each meal entry. Pass that id to:
 
-- `mfp_update_food_entry` - change `meal`, `quantity`, `unit` (serving-size label, e.g. `"350 ml"`), or `weight_id` (raw MFP serving-size option id, overrides `unit`) for an entry; requires `date` for historical entries. MyFitnessPal can rewrite an entry during edit, so the response reports `current_entry_id` and `entry_id_changed` so you can keep tracking the right row.
+- `mfp_update_food_entry` - change `meal`, `quantity`, `unit` (see below), or `weight_id` (raw MFP serving-size option id, overrides `unit`) for an entry; changing the serving requires `quantity`; requires `date` for historical entries. MyFitnessPal can rewrite an entry during edit, so the response reports `current_entry_id` and `entry_id_changed` so you can keep tracking the right row.
 - `mfp_delete_food_entry` - delete an entry by `entry_id` (requires `date` for historical entries).
+
+### Logging by unit
+
+`mfp_add_food_to_diary` and `mfp_update_food_entry` take an optional `unit`:
+
+- A bare unit (`g`, `oz`, `ml`, `cup`...; English or Spanish spellings such as `gramos`) makes `quantity` a literal amount: `quantity=150, unit="g"` logs 150 g. When a food lists the same unit more than once (`100 g` and `1 g`), the value-1 serving is used, so the amount is never multiplied (see AdamWalt/myfitnesspal-mcp-python#18). If only `100 g` exists, 150 g is logged as 1.5 servings.
+- A full serving label as `mfp_get_food_details` lists it (`"1 container (1000 mls ea.)"`) selects that serving, and `quantity` counts it.
+- A unit the food does not have is an error that lists its servings; nothing is written.
 
 ### Creating a custom food
 
